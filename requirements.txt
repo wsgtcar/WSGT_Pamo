@@ -6,4 +6,6 @@ deap
 scikit-learn
 matplotlib
 plotly
+openpyxl
+
 
