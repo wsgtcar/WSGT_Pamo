@@ -342,7 +342,7 @@ def process_completed_results(async_results, hof, temp_results_file,
 
 
 # Function to perform streaming optimization with optimized parallel processing
-# FIX: removed @st.cache_resource to avoid multiprocessing + cache hang
+
 def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights, output_path, objective_names):
     try:
         st.write("Starting optimization process with streaming parallel processing...")
@@ -393,7 +393,7 @@ def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights,
             f.write(','.join(df_columns) + '\n')
 
         # Create a pool of worker processes
-        with multiprocessing.Pool(processes=num_cores) as pool:
+        with multiprocessing.get_context("spawn").Pool(processes=num_cores) as pool:
             # Use a queue of async results to maximize CPU utilization
             async_results = []
             batches = []
