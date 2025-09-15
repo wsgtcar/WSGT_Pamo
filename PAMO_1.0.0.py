@@ -364,7 +364,7 @@ def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights,
         st.write(f"Total parameter combinations to evaluate: {total_combinations}")
 
         # Use limited threads for Streamlit Cloud compatibility
-        num_cores = min(st.session_state.get('num_cores', 4), 4)  # Max 4 threads
+        num_cores = min(st.session_state.get('num_cores', 8), 8)  # Max 4 threads
         st.write(f"Using {num_cores} threads for processing (Streamlit Cloud optimized)")
 
         # Calculate optimal batch size for Streamlit Cloud (smaller batches for stability)
@@ -1747,3 +1747,4 @@ with st.sidebar:
     st.caption("*email:* rodrigo.carvalho@wernersobek.com")
     st.caption("*Tel* +49.40.6963863-14")
     st.caption("*Mob* +49.171.964.7850")
+
