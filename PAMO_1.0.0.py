@@ -1176,17 +1176,19 @@ def display_optimization_results():
 
                 # Export button for filtered solutions
                 if len(filtered_df) > 0:
-                    export_path = st.text_input("Export filtered solutions to:", value="filtered_solutions.xlsx")
+                    # Convert DataFrame to Excel bytes for download
+                    from io import BytesIO
+                    excel_buffer = BytesIO()
+                    filtered_df.to_excel(excel_buffer, index=False, engine='openpyxl')
+                    excel_data = excel_buffer.getvalue()
 
-                    if st.button("Export Filtered Solutions", use_container_width=True):
-                        try:
-                            if export_path.endswith(".xlsx"):
-                                filtered_df.to_excel(export_path, index=False)
-                            else:
-                                filtered_df.to_csv(export_path, index=False)
-                            st.success(f"Filtered solutions exported to {export_path}")
-                        except Exception as e:
-                            st.error(f"Error exporting filtered solutions: {e}")
+                    st.download_button(
+                        label="Export Filtered Solutions",
+                        data=excel_data,
+                        file_name="filtered_solutions.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
 
         except Exception as e:
             st.error(f"Error in All Computed Solutions section: {e}")
@@ -1558,19 +1560,20 @@ def explore_uploaded_results():
 
             # Export button for filtered solutions from uploaded data
             if len(filtered_df) > 0:
-                export_path = st.text_input("Export filtered solutions to:",
-                                            value="uploaded_filtered_solutions.xlsx",
-                                            key="explorer_export_path")
+                # Convert DataFrame to Excel bytes for download
+                from io import BytesIO
+                excel_buffer = BytesIO()
+                filtered_df.to_excel(excel_buffer, index=False, engine='openpyxl')
+                excel_data = excel_buffer.getvalue()
 
-                if st.button("Export Filtered Solutions", key="explorer_export_btn", use_container_width=True):
-                    try:
-                        if export_path.endswith(".xlsx"):
-                            filtered_df.to_excel(export_path, index=False)
-                        else:
-                            filtered_df.to_csv(export_path, index=False)
-                        st.success(f"Filtered solutions exported to {export_path}")
-                    except Exception as e:
-                        st.error(f"Error exporting filtered solutions: {e}")
+                st.download_button(
+                    label="Export Filtered Solutions",
+                    data=excel_data,
+                    file_name="uploaded_filtered_solutions.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="explorer_export_btn",
+                    use_container_width=True
+                )
 
         except Exception as e:
             st.error(f"Error in All Computed Solutions section: {e}")
@@ -1747,6 +1750,3 @@ with st.sidebar:
     st.caption("*email:* rodrigo.carvalho@wernersobek.com")
     st.caption("*Tel* +49.40.6963863-14")
     st.caption("*Mob* +49.171.964.7850")
-
-
-
