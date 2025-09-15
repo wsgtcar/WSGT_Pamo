@@ -342,7 +342,7 @@ def process_completed_results(async_results, hof, temp_results_file,
 
 
 # Function to perform streaming optimization with optimized parallel processing
-@st.cache_resource
+# FIX: removed @st.cache_resource to avoid multiprocessing + cache hang
 def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights, output_path, objective_names):
     try:
         st.write("Starting optimization process with streaming parallel processing...")
