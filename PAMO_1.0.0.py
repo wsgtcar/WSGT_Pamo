@@ -14,8 +14,8 @@ import os
 import pickle
 import tempfile
 from functools import partial
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor, as_completed
 import matplotlib.cm as cm
 
 st.set_page_config(
@@ -298,16 +298,12 @@ def process_completed_results(async_results, hof, temp_results_file,
     """Process any completed async results"""
     # Check which results are ready
     completed_indices = []
-    for i, (future, batch_size) in enumerate(async_results):
-        if future.done():
+    for i, (async_result, batch_size) in enumerate(async_results):
+        if async_result.ready():
             completed_indices.append(i)
 
-            try:
-                # Get the result
-                result_batch = future.result()
-            except Exception as e:
-                st.error(f"Error in batch processing: {e}")
-                continue
+            # Get the result
+            result_batch = async_result.get()
 
             # Process results and update Pareto front
             with open(temp_results_file, 'a') as f:
@@ -362,17 +358,19 @@ def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights,
 
         st.write(f"Total parameter combinations to evaluate: {total_combinations}")
 
-        # Use limited threads for Streamlit Cloud compatibility
-        num_cores = min(st.session_state.get('num_cores', 4), 4)  # Max 4 threads
-        st.write(f"Using {num_cores} threads for processing (Streamlit Cloud optimized)")
+        # Use the number of cores from session state
+        num_cores = st.session_state.get('num_cores', 8)
+        st.write(f"Using {num_cores} CPU cores for parallel processing")
 
-        # Calculate optimal batch size for Streamlit Cloud (smaller batches for stability)
+        # Calculate optimal batch size based on total combinations
         if total_combinations < 1000:
-            batch_size = max(1, min(10, total_combinations // 10))
+            batch_size = max(1, total_combinations // (num_cores * 2))
         elif total_combinations < 10000:
-            batch_size = max(5, min(50, total_combinations // 20))
+            batch_size = max(10, total_combinations // (num_cores * 4))
+        elif total_combinations < 100000:
+            batch_size = max(50, min(500, total_combinations // (num_cores * 8)))
         else:
-            batch_size = max(10, min(100, total_combinations // 50))  # Much smaller batches for large datasets
+            batch_size = max(100, min(500, total_combinations // (num_cores * 16)))
 
         st.write(f"Using adaptive batch size: {batch_size}")
 
@@ -394,8 +392,8 @@ def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights,
             # Write header
             f.write(','.join(df_columns) + '\n')
 
-        # Create a pool of worker threads (more Streamlit-friendly than processes)
-        with ThreadPoolExecutor(max_workers=min(num_cores, 4)) as executor:
+        # Create a pool of worker processes
+        with multiprocessing.Pool(processes=num_cores) as pool:
             # Use a queue of async results to maximize CPU utilization
             async_results = []
             batches = []
@@ -411,28 +409,18 @@ def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights,
                     batches.append(current_batch)
 
                     # Submit batch for async processing
-                    future = executor.submit(evaluate_batch, current_batch, _models, num_objectives)
-                    async_results.append((future, len(current_batch)))
+                    async_result = pool.apply_async(evaluate_batch, args=(current_batch, _models, num_objectives))
+                    async_results.append((async_result, len(current_batch)))
 
                     # Reset current batch
                     current_batch = []
 
-                # Process completed results to free up memory
+                # Process any completed results
                 processed_count = process_completed_results(
                     async_results, hof, temp_results_file,
                     processed_count, total_combinations,
                     progress_bar, status_text, start_time
                 )
-                
-                # Periodic memory cleanup and progress check
-                if i % 100 == 0:
-                    import gc
-                    gc.collect()
-                    
-                # Check if we should stop early due to Streamlit constraints
-                if time.time() - start_time > 300:  # 5 minutes timeout
-                    st.warning("Optimization stopped after 5 minutes to prevent timeout. Partial results will be saved.")
-                    break
 
             # Submit any remaining combinations
             if current_batch:
@@ -440,8 +428,8 @@ def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights,
                 batches.append(current_batch)
 
                 # Submit batch for async processing
-                future = executor.submit(evaluate_batch, current_batch, _models, num_objectives)
-                async_results.append((future, len(current_batch)))
+                async_result = pool.apply_async(evaluate_batch, args=(current_batch, _models, num_objectives))
+                async_results.append((async_result, len(current_batch)))
 
             # Wait for all remaining results to complete
             while async_results:
