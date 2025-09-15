@@ -1579,7 +1579,7 @@ def main():
             st.header("Setup")
             n_estimators = st.slider("Number of Trees in Random Forest", min_value=10, max_value=200, value=50,help="Only change if you are sure what you are doing")
             cv_folds = st.slider("Cross-Validation Folds", min_value=3, max_value=10, value=5,help="Only change if you are sure what you are doing")
-            st.session_state['num_cores'] = st.slider("Number of CPU Cores", min_value=1, max_value=16, value=1, help="Only change if you are sure what you are doing")
+            st.session_state['num_cores'] = st.slider("Number of CPU Cores", min_value=1, max_value=16, value=8, help="Only change if you are sure what you are doing")
 
         # Create tabs for Training, Results and Explorer
         tab1, tab2, tab3 = st.tabs(["Training", "Results", "Explorer"])
@@ -1735,4 +1735,3 @@ with st.sidebar:
     st.caption("*email:* rodrigo.carvalho@wernersobek.com")
     st.caption("*Tel* +49.40.6963863-14")
     st.caption("*Mob* +49.171.964.7850")
-
