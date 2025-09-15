@@ -14,8 +14,8 @@ import os
 import pickle
 import tempfile
 from functools import partial
-
-
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import matplotlib.cm as cm
 
 st.set_page_config(
@@ -292,50 +292,42 @@ def evaluate_batch(batch_params, models, num_objectives):
 
 
 # Helper function to process completed async results
+def process_completed_results(async_results, hof, temp_results_file,
+                              processed_count, total_combinations,
+                              progress_bar, status_text, start_time):
+    """Process any completed async results"""
+    # Check which results are ready
+    completed_indices = []
+    for i, (future, batch_size) in enumerate(async_results):
+        if future.done():
+            completed_indices.append(i)
 
+            try:
+                # Get the result
+                result_batch = future.result()
+            except Exception as e:
+                st.error(f"Error in batch processing: {e}")
+                continue
 
-
-# Function to perform streaming optimization with sequential processing
-@st.cache_resource
-def optimize_parameters_sequentially(param_ranges, num_objectives, _models, weights, output_path, objective_names):
-    try:
-        st.write("Starting optimization process sequentially...")
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-
-        start_time = time.time()
-
-        hof = tools.ParetoFront()
-
-        param_generator, total_combinations = parameter_combinations_generator(param_ranges)
-
-        st.write(f"Total parameter combinations to evaluate: {total_combinations}")
-
-        processed_count = 0
-        param_labels = list(param_ranges.keys())
-        fitness_labels = list(objective_names)
-        uncertainty_labels = [f'Uncertainty_{name}' for name in objective_names]
-        df_columns = param_labels + fitness_labels + uncertainty_labels
-
-        temp_results_file = "temp_results.csv"
-        with open(temp_results_file, 'w') as f:
-            f.write(','.join(df_columns) + '\n')
-
-        for i, params in enumerate(param_generator):
-            result = evaluate_batch([params], _models, num_objectives)[0]
-
-            individual = creator.Individual(result['params'])
-            individual.fitness.values = tuple(result['predictions'])
-            individual.weighted_sum = 0.0
-            individual.uncertainty = tuple(result['uncertainties'])
-
-            hof.update([individual])
-
+            # Process results and update Pareto front
             with open(temp_results_file, 'a') as f:
-                row_data = [str(float(p)) for p in result['params']] + result['rounded_fitness'] + result['rounded_uncertainty']
-                f.write(','.join(row_data) + '\n')
+                for result in result_batch:
+                    # Create individual
+                    individual = creator.Individual(result['params'])
+                    individual.fitness.values = tuple(result['predictions'])
+                    individual.weighted_sum = 0.0  # to be calculated after normalization
+                    individual.uncertainty = tuple(result['uncertainties'])
 
-            processed_count += 1
+                    # Update Pareto front
+                    hof.update([individual])
+
+                    # Write to CSV directly to save memory
+                    row_data = [str(float(p)) for p in result['params']] + result['rounded_fitness'] + result[
+                        'rounded_uncertainty']
+                    f.write(','.join(row_data) + '\n')
+
+            # Update progress
+            processed_count += batch_size
             progress = min(1.0, processed_count / total_combinations)
             progress_bar.progress(progress)
 
@@ -345,6 +337,120 @@ def optimize_parameters_sequentially(param_ranges, num_objectives, _models, weig
 
             status_text.text(f"Processed {processed_count}/{total_combinations} combinations. " +
                              f"Elapsed: {elapsed_time:.2f}s. Estimated remaining: {remaining_time:.2f}s.")
+
+    # Remove completed results
+    for i in sorted(completed_indices, reverse=True):
+        async_results.pop(i)
+
+    return processed_count
+
+
+# Function to perform streaming optimization with optimized parallel processing
+@st.cache_resource
+def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights, output_path, objective_names):
+    try:
+        st.write("Starting optimization process with streaming parallel processing...")
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        start_time = time.time()
+
+        hof = tools.ParetoFront()
+
+        # Get parameter combinations generator and total count
+        param_generator, total_combinations = parameter_combinations_generator(param_ranges)
+
+        st.write(f"Total parameter combinations to evaluate: {total_combinations}")
+
+        # Use limited threads for Streamlit Cloud compatibility
+        num_cores = min(st.session_state.get('num_cores', 4), 4)  # Max 4 threads
+        st.write(f"Using {num_cores} threads for processing (Streamlit Cloud optimized)")
+
+        # Calculate optimal batch size for Streamlit Cloud (smaller batches for stability)
+        if total_combinations < 1000:
+            batch_size = max(1, min(10, total_combinations // 10))
+        elif total_combinations < 10000:
+            batch_size = max(5, min(50, total_combinations // 20))
+        else:
+            batch_size = max(10, min(100, total_combinations // 50))  # Much smaller batches for large datasets
+
+        st.write(f"Using adaptive batch size: {batch_size}")
+
+        # Prepare for streaming processing
+        processed_count = 0
+        batch_count = 0
+
+        # Prepare column labels for the DataFrame
+        param_labels = list(param_ranges.keys())
+        fitness_labels = list(objective_names)
+        uncertainty_labels = [f'Uncertainty_{name}' for name in objective_names]
+
+        # Create DataFrame for results with chunked writing
+        df_columns = param_labels + fitness_labels + uncertainty_labels
+
+        # Create a temporary file for results
+        temp_results_file = "temp_results.csv"
+        with open(temp_results_file, 'w') as f:
+            # Write header
+            f.write(','.join(df_columns) + '\n')
+
+        # Create a pool of worker threads (more Streamlit-friendly than processes)
+        with ThreadPoolExecutor(max_workers=min(num_cores, 4)) as executor:
+            # Use a queue of async results to maximize CPU utilization
+            async_results = []
+            batches = []
+            current_batch = []
+
+            # Process parameter combinations in streaming batches
+            for i, params in enumerate(param_generator):
+                current_batch.append(params)
+
+                # When batch is full, submit it asynchronously
+                if len(current_batch) >= batch_size:
+                    batch_count += 1
+                    batches.append(current_batch)
+
+                    # Submit batch for async processing
+                    future = executor.submit(evaluate_batch, current_batch, _models, num_objectives)
+                    async_results.append((future, len(current_batch)))
+
+                    # Reset current batch
+                    current_batch = []
+
+                # Process completed results to free up memory
+                processed_count = process_completed_results(
+                    async_results, hof, temp_results_file,
+                    processed_count, total_combinations,
+                    progress_bar, status_text, start_time
+                )
+                
+                # Periodic memory cleanup and progress check
+                if i % 100 == 0:
+                    import gc
+                    gc.collect()
+                    
+                # Check if we should stop early due to Streamlit constraints
+                if time.time() - start_time > 300:  # 5 minutes timeout
+                    st.warning("Optimization stopped after 5 minutes to prevent timeout. Partial results will be saved.")
+                    break
+
+            # Submit any remaining combinations
+            if current_batch:
+                batch_count += 1
+                batches.append(current_batch)
+
+                # Submit batch for async processing
+                future = executor.submit(evaluate_batch, current_batch, _models, num_objectives)
+                async_results.append((future, len(current_batch)))
+
+            # Wait for all remaining results to complete
+            while async_results:
+                processed_count = process_completed_results(
+                    async_results, hof, temp_results_file,
+                    processed_count, total_combinations,
+                    progress_bar, status_text, start_time
+                )
+                time.sleep(0.1)  # Short sleep to prevent CPU spinning
 
         # Complete progress bar
         progress_bar.progress(1.0)
@@ -757,7 +863,8 @@ def initialize_session_state():
     if 'active_tab' not in st.session_state:
         st.session_state['active_tab'] = "Training"
 
-
+    if 'num_cores' not in st.session_state:
+        st.session_state['num_cores'] = 8
 
     if 'output_path' not in st.session_state:
         st.session_state['output_path'] = "evaluated_solutions.xlsx"
@@ -1484,7 +1591,7 @@ def main():
             st.header("Setup")
             n_estimators = st.slider("Number of Trees in Random Forest", min_value=10, max_value=200, value=50,help="Only change if you are sure what you are doing")
             cv_folds = st.slider("Cross-Validation Folds", min_value=3, max_value=10, value=5,help="Only change if you are sure what you are doing")
-
+            st.session_state['num_cores'] = st.slider("Number of CPU Cores", min_value=1, max_value=16, value=8, help="Only change if you are sure what you are doing")
 
         # Create tabs for Training, Results and Explorer
         tab1, tab2, tab3 = st.tabs(["Training", "Results", "Explorer"])
@@ -1598,10 +1705,11 @@ def main():
                         st.error("No trained models available. Please train models first.")
                         return
 
-                    # Run optimization with sequential processing
+                    # Run optimization with parallel processing
                     with st.spinner("Optimizing parameters..."):
                         objective_names_list = list(objective_names)
-                        hof = optimize_parameters_sequentially(param_ranges, num_objectives, models, weights, output_path, objective_names_list)
+                        hof = optimize_parameters_parallel(param_ranges, num_objectives, models, weights, output_path,
+                                                           objective_names_list)
 
                     if hof:
                         # Store results in session state for exploration mode
