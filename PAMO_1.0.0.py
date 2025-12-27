@@ -4,8 +4,10 @@ import numpy as np
 from PIL.ImageChops import lighter
 from deap import base, creator, tools
 import itertools
-from sklearn.ensemble import RandomForestRegressor
-from sklearn.model_selection import KFold, cross_val_score, learning_curve
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import PolynomialFeatures, StandardScaler
+from sklearn.linear_model import Ridge
+from sklearn.model_selection import KFold, cross_val_score, cross_val_predict, learning_curve
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import plotly.express as px
@@ -17,6 +19,73 @@ from functools import partial
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import matplotlib.cm as cm
+
+
+# --- Poly(deg=2)+Ridge helpers (PAMO 1.1.9) ---
+
+def _alpha_from_n_estimators(n_estimators: int) -> float:
+    """Map the existing 'Number of Trees' slider to a Ridge alpha, without changing the UI."""
+    # More 'trees' -> lower regularization (more flexible fit)
+    try:
+        n = float(max(1, int(n_estimators)))
+    except Exception:
+        n = 50.0
+    return max(0.001, 10.0 / n)  # e.g., 100 -> 0.10 ; 50 -> 0.20 ; 10 -> 1.00
+
+
+def build_poly2_ridge(alpha: float) -> Pipeline:
+    """Create a Poly(deg=2)+Scaler+Ridge pipeline that predicts a single objective."""
+    return Pipeline([
+        ("poly", PolynomialFeatures(degree=2, include_bias=False)),
+        ("scaler", StandardScaler()),
+        ("ridge", Ridge(alpha=alpha))
+    ])
+
+
+def compute_param_sensitivity_from_poly_ridge(model: Pipeline, base_feature_names) -> np.ndarray:
+    """
+    Compute a parameter-level sensitivity vector (length = number of original parameters),
+    derived from absolute Ridge coefficients in the polynomial feature space.
+
+    This keeps the existing UI intact (sensitivity plots remain at parameter level).
+    """
+    try:
+        poly = model.named_steps["poly"]
+        ridge = model.named_steps["ridge"]
+
+        # Names of expanded polynomial features (e.g., par1, par1 par2, par1^2)
+        feature_names = poly.get_feature_names_out(input_features=np.array(base_feature_names, dtype=str))
+
+        coefs = getattr(ridge, "coef_", None)
+        if coefs is None:
+            return np.zeros(len(base_feature_names), dtype=float)
+
+        # Ridge with a single target -> coef_ shape (n_features,)
+        coefs = np.asarray(coefs).reshape(-1)
+        abs_coefs = np.abs(coefs)
+
+        sensitivity = np.zeros(len(base_feature_names), dtype=float)
+        base_feature_names = list(map(str, base_feature_names))
+
+        for fname, w in zip(feature_names, abs_coefs):
+            # Parse involved base features:
+            # - "par1 par4" -> ["par1", "par4"]
+            # - "par1^2"    -> ["par1"]
+            involved = []
+            for token in fname.split():
+                if "^" in token:
+                    token = token.split("^")[0]
+                involved.append(token)
+
+            for j, base in enumerate(base_feature_names):
+                if base in involved:
+                    sensitivity[j] += float(w)
+
+        return sensitivity
+
+    except Exception:
+        return np.zeros(len(base_feature_names), dtype=float)
+
 
 st.set_page_config(
     initial_sidebar_state="collapsed",  # Optional
@@ -72,6 +141,19 @@ def load_data(num_objectives):
 # Function to preprocess data and train model with cross-validation
 @st.cache_data
 def preprocess_and_train_with_cv(_df, num_objectives, n_estimators=50, cv_folds=5):
+    """
+    Preprocess data and train one model per objective using:
+      Poly(deg=2) + StandardScaler + Ridge
+
+    Notes:
+    - The UI remains unchanged (we keep 'n_estimators' argument from the existing slider).
+      Internally we map it to Ridge's alpha (regularization strength).
+    - We keep the same expected outputs:
+      * list of trained models (one per objective)
+      * parameter names
+      * objective names
+      * per-objective uncertainty values are stored in session_state for downstream optimization output
+    """
     try:
         X = _df.drop(_df.columns[-num_objectives:], axis=1)
         y = [_df[col] for col in _df.columns[-num_objectives:]]
@@ -81,28 +163,44 @@ def preprocess_and_train_with_cv(_df, num_objectives, n_estimators=50, cv_folds=
 
         models = []
         cv_scores = []
-        feature_importances = []
+        feature_importances = []  # parameter-level sensitivities (keeps existing UI)
+        objective_uncertainties = []  # std of CV residuals per objective (keeps uncertainty outputs)
+
+        alpha = _alpha_from_n_estimators(n_estimators)
 
         # For each objective
         for i, y_i in enumerate(y):
-            # Initialize model
-            model = RandomForestRegressor(n_estimators=n_estimators, random_state=42)
+            # Initialize model (single-output)
+            model = build_poly2_ridge(alpha=alpha)
 
-            # Perform cross-validation
+            # Perform cross-validation (R²)
             scores = cross_val_score(model, X, y_i, cv=cv, scoring='r2')
             cv_scores.append(scores)
+
+            # Estimate a simple uncertainty metric from cross-validated residuals
+            try:
+                y_pred_cv = cross_val_predict(model, X, y_i, cv=cv)
+                resid = np.asarray(y_i) - np.asarray(y_pred_cv)
+                obj_unc = float(np.std(resid)) if len(resid) > 1 else 0.0
+            except Exception:
+                obj_unc = 0.0
+            objective_uncertainties.append(obj_unc)
 
             # Train final model on all data
             model.fit(X, y_i)
             models.append(model)
 
-            # Store feature importances
-            feature_importances.append(model.feature_importances_)
+            # Store parameter-level sensitivities from polynomial coefficients
+            sens = compute_param_sensitivity_from_poly_ridge(model, X.columns)
+            feature_importances.append(sens)
 
             # Print cross-validation results
             st.write(
-                f"Objective {i + 1} ({_df.columns[-num_objectives + i]}) - Cross-validation R² scores: {[f'{s:.2f}' for s in scores]}")
+                f"Objective {i + 1} ({_df.columns[-num_objectives + i]}) - Cross-validation R² scores: "
+                f"{[f'{s:.2f}' for s in scores]}"
+            )
             st.write(f"Mean R²: {np.mean(scores):.2f} (±{np.std(scores):.2f})")
+            st.write(f"Estimated uncertainty (CV residual std): {obj_unc:.2f}")
 
         # Visualize cross-validation results
         if cv_scores:
@@ -115,13 +213,15 @@ def preprocess_and_train_with_cv(_df, num_objectives, n_estimators=50, cv_folds=
             plt.tight_layout()
             st.pyplot(fig)
 
-        # Visualize feature sensitivity
+        # Visualize feature sensitivity (parameter-level, preserves existing plots)
         if feature_importances:
             fig, axes = plt.subplots(1, len(y), figsize=(15, 5), sharey=False, frameon=False)
             if len(y) == 1:
                 axes = [axes]
 
             for i, (importances, ax) in enumerate(zip(feature_importances, axes)):
+                importances = np.asarray(importances, dtype=float)
+
                 # Sort indices by importance
                 sorted_indices = np.argsort(importances)
                 sorted_importances = importances[sorted_indices]
@@ -140,8 +240,9 @@ def preprocess_and_train_with_cv(_df, num_objectives, n_estimators=50, cv_folds=
             plt.tight_layout()
             st.pyplot(fig)
 
-        # Store models directly in session state
+        # Store models and uncertainties in session state (used by optimization)
         st.session_state['models'] = models
+        st.session_state['objective_uncertainties'] = objective_uncertainties
 
         # Test prediction with a sample
         if X.shape[0] > 0:
@@ -239,7 +340,7 @@ def parameter_combinations_generator(param_ranges):
 
 
 # Optimized function to evaluate a batch of parameter combinations
-def evaluate_batch(batch_params, models, num_objectives):
+def evaluate_batch(batch_params, models, num_objectives, objective_uncertainties=None):
     results = []
 
     for params in batch_params:
@@ -250,18 +351,18 @@ def evaluate_batch(batch_params, models, num_objectives):
         predictions = []
         uncertainties = []
 
-        for model in models:
-            # For Random Forest, estimate uncertainty using predictions from individual trees
-            tree_preds = np.array([tree.predict(params_array) for tree in model.estimators_])
+        for obj_idx, model in enumerate(models):
+            # Poly(deg=2)+Ridge: direct prediction
+            pred_val = float(model.predict(params_array)[0])
 
-            # Mean prediction across trees
-            mean_pred = np.mean(tree_preds, axis=0)[0]
+            # Uncertainty: use per-objective CV residual std (constant per objective)
+            if objective_uncertainties is not None and obj_idx < len(objective_uncertainties):
+                unc_val = float(objective_uncertainties[obj_idx])
+            else:
+                unc_val = 0.0
 
-            # Standard deviation as uncertainty measure
-            std_pred = np.std(tree_preds, axis=0)[0]
-
-            predictions.append(float(mean_pred))
-            uncertainties.append(float(std_pred))
+            predictions.append(pred_val)
+            uncertainties.append(unc_val)
 
         # Ensure correct length
         if len(predictions) != num_objectives:
@@ -348,7 +449,7 @@ def process_completed_results(async_results, hof, temp_results_file,
 
 # Function to perform streaming optimization with optimized parallel processing
 @st.cache_resource
-def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights, output_path, objective_names):
+def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights, output_path, objective_names, objective_uncertainties=None):
     try:
         st.write("Starting optimization process with streaming parallel processing...")
         progress_bar = st.progress(0)
@@ -412,7 +513,7 @@ def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights,
                     batches.append(current_batch)
 
                     # Submit batch for async processing
-                    future = executor.submit(evaluate_batch, current_batch, _models, num_objectives)
+                    future = executor.submit(evaluate_batch, current_batch, _models, num_objectives, objective_uncertainties)
                     async_results.append((future, len(current_batch)))
 
                     # Reset current batch
@@ -442,7 +543,7 @@ def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights,
                 batches.append(current_batch)
 
                 # Submit batch for async processing
-                future = executor.submit(evaluate_batch, current_batch, _models, num_objectives)
+                future = executor.submit(evaluate_batch, current_batch, _models, num_objectives, objective_uncertainties)
                 async_results.append((future, len(current_batch)))
 
             # Wait for all remaining results to complete
@@ -1338,7 +1439,8 @@ def explore_uploaded_results():
 
                 # Train a model for each objective
                 for i, y_i in enumerate(y_train):
-                    model = RandomForestRegressor(n_estimators=100, random_state=42)
+                    alpha = _alpha_from_n_estimators(100)
+                    model = build_poly2_ridge(alpha=alpha)
                     model.fit(X_train, y_i)
                     models.append(model)
 
@@ -1713,7 +1815,8 @@ def main():
                     with st.spinner("Optimizing parameters..."):
                         objective_names_list = list(objective_names)
                         hof = optimize_parameters_parallel(param_ranges, num_objectives, models, weights, output_path,
-                                                           objective_names_list)
+                                                           objective_names_list,
+                                                           st.session_state.get('objective_uncertainties', None))
 
                     if hof:
                         # Store results in session state for exploration mode
