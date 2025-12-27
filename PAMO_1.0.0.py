@@ -488,7 +488,7 @@ def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights,
             f.write(','.join(df_columns) + '\n')
 
         # Create a pool of worker threads (more Streamlit-friendly than processes)
-        with ThreadPoolExecutor(max_workers=min(num_cores, 4)) as executor:
+        with ThreadPoolExecutor(max_workers=num_cores) as executor:
             # Use a queue of async results to maximize CPU utilization
             async_results = []
             batches = []
@@ -521,13 +521,6 @@ def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights,
                 if i % 100 == 0:
                     import gc
                     gc.collect()
-
-                # Check if we should stop early due to Streamlit constraints
-                if time.time() - start_time > 300:  # 5 minutes timeout
-                    st.warning(
-                        "Optimization stopped after 5 minutes to prevent timeout. Partial results will be saved.")
-                    break
-
             # Submit any remaining combinations
             if current_batch:
                 batch_count += 1
