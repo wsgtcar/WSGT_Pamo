@@ -14,8 +14,8 @@ import os
 import pickle
 import tempfile
 from functools import partial
-import multiprocessing
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import matplotlib.cm as cm
 
 st.set_page_config(
@@ -36,6 +36,7 @@ with col2:
     st.image("WS_Logo.png", width=900)
 
 st.title("Machine Learning Assisted Optimization")
+
 
 # Create a multi-objective fitness class with variable number of objectives
 def create_fitness_class(num_objectives, weights):
@@ -298,12 +299,16 @@ def process_completed_results(async_results, hof, temp_results_file,
     """Process any completed async results"""
     # Check which results are ready
     completed_indices = []
-    for i, (async_result, batch_size) in enumerate(async_results):
-        if async_result.ready():
+    for i, (future, batch_size) in enumerate(async_results):
+        if future.done():
             completed_indices.append(i)
 
-            # Get the result
-            result_batch = async_result.get()
+            try:
+                # Get the result
+                result_batch = future.result()
+            except Exception as e:
+                st.error(f"Error in batch processing: {e}")
+                continue
 
             # Process results and update Pareto front
             with open(temp_results_file, 'a') as f:
@@ -358,19 +363,17 @@ def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights,
 
         st.write(f"Total parameter combinations to evaluate: {total_combinations}")
 
-        # Use the number of cores from session state
-        num_cores = st.session_state.get('num_cores', 8)
-        st.write(f"Using {num_cores} CPU cores for parallel processing")
+        # Use limited threads for Streamlit Cloud compatibility
+        num_cores = min(st.session_state.get('num_cores', 8), 4)  # Max 2 threads
+        st.write(f"Using {num_cores} threads for processing (Streamlit Cloud optimized)")
 
-        # Calculate optimal batch size based on total combinations
+        # Calculate optimal batch size for Streamlit Cloud (smaller batches for stability)
         if total_combinations < 1000:
-            batch_size = max(1, total_combinations // (num_cores * 2))
+            batch_size = max(1, min(100, total_combinations // 10))
         elif total_combinations < 10000:
-            batch_size = max(10, total_combinations // (num_cores * 4))
-        elif total_combinations < 100000:
-            batch_size = max(50, min(500, total_combinations // (num_cores * 8)))
+            batch_size = max(5, min(250, total_combinations // 20))
         else:
-            batch_size = max(100, min(500, total_combinations // (num_cores * 16)))
+            batch_size = max(10, min(500, total_combinations // 50))  # Much smaller batches for large datasets
 
         st.write(f"Using adaptive batch size: {batch_size}")
 
@@ -392,8 +395,8 @@ def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights,
             # Write header
             f.write(','.join(df_columns) + '\n')
 
-        # Create a pool of worker processes
-        with multiprocessing.Pool(processes=num_cores) as pool:
+        # Create a pool of worker threads (more Streamlit-friendly than processes)
+        with ThreadPoolExecutor(max_workers=min(num_cores, 4)) as executor:
             # Use a queue of async results to maximize CPU utilization
             async_results = []
             batches = []
@@ -409,18 +412,29 @@ def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights,
                     batches.append(current_batch)
 
                     # Submit batch for async processing
-                    async_result = pool.apply_async(evaluate_batch, args=(current_batch, _models, num_objectives))
-                    async_results.append((async_result, len(current_batch)))
+                    future = executor.submit(evaluate_batch, current_batch, _models, num_objectives)
+                    async_results.append((future, len(current_batch)))
 
                     # Reset current batch
                     current_batch = []
 
-                # Process any completed results
+                # Process completed results to free up memory
                 processed_count = process_completed_results(
                     async_results, hof, temp_results_file,
                     processed_count, total_combinations,
                     progress_bar, status_text, start_time
                 )
+
+                # Periodic memory cleanup and progress check
+                if i % 100 == 0:
+                    import gc
+                    gc.collect()
+
+                # Check if we should stop early due to Streamlit constraints
+                if time.time() - start_time > 300:  # 5 minutes timeout
+                    st.warning(
+                        "Optimization stopped after 5 minutes to prevent timeout. Partial results will be saved.")
+                    break
 
             # Submit any remaining combinations
             if current_batch:
@@ -428,8 +442,8 @@ def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights,
                 batches.append(current_batch)
 
                 # Submit batch for async processing
-                async_result = pool.apply_async(evaluate_batch, args=(current_batch, _models, num_objectives))
-                async_results.append((async_result, len(current_batch)))
+                future = executor.submit(evaluate_batch, current_batch, _models, num_objectives)
+                async_results.append((future, len(current_batch)))
 
             # Wait for all remaining results to complete
             while async_results:
@@ -960,10 +974,8 @@ def display_optimization_results():
                     "Estimated Value": [f"{p:.2f}" for p in preds]
                 })
 
-
                 # Create diagrams for each objective with color scale
                 for i, (obj, pred) in enumerate(zip(objective_names_list, preds)):
-
                     obj_values = [float(ind.fitness.values[i]) for ind in hof]
                     obj_min, obj_max = min(obj_values), max(obj_values)
                     color_value = (pred - obj_min) / (obj_max - obj_min) if obj_max > obj_min else 0.5
@@ -1164,17 +1176,19 @@ def display_optimization_results():
 
                 # Export button for filtered solutions
                 if len(filtered_df) > 0:
-                    export_path = st.text_input("Export filtered solutions to:", value="filtered_solutions.xlsx")
+                    # Convert DataFrame to Excel bytes for download
+                    from io import BytesIO
+                    excel_buffer = BytesIO()
+                    filtered_df.to_excel(excel_buffer, index=False, engine='openpyxl')
+                    excel_data = excel_buffer.getvalue()
 
-                    if st.button("Export Filtered Solutions", use_container_width=True):
-                        try:
-                            if export_path.endswith(".xlsx"):
-                                filtered_df.to_excel(export_path, index=False)
-                            else:
-                                filtered_df.to_csv(export_path, index=False)
-                            st.success(f"Filtered solutions exported to {export_path}")
-                        except Exception as e:
-                            st.error(f"Error exporting filtered solutions: {e}")
+                    st.download_button(
+                        label="Export Filtered Solutions",
+                        data=excel_data,
+                        file_name="filtered_solutions.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                        use_container_width=True
+                    )
 
         except Exception as e:
             st.error(f"Error in All Computed Solutions section: {e}")
@@ -1273,7 +1287,7 @@ def explore_uploaded_results():
     weights = [-1.0 for _ in objective_names]  # Default to minimization
 
     # Allow user to adjust weights
-    with st.expander("Setup Objectives Weights",expanded=False):
+    with st.expander("Setup Objectives Weights", expanded=False):
         st.write("### Setup Objectives Weights")
         st.write("Set weights for each objective (negative for minimization, positive for maximization)")
 
@@ -1289,7 +1303,7 @@ def explore_uploaded_results():
                 )
 
     # Display basic statistics
-    with st.expander("Dataset Overview",expanded=False):
+    with st.expander("Dataset Overview", expanded=False):
         st.write("### Dataset Overview")
         st.write(f"**Total Solutions:** {len(df)}")
         st.write(f"**Parameters:** {', '.join(param_names)}")
@@ -1334,8 +1348,6 @@ def explore_uploaded_results():
                     "Objective": objective_names,
                     "Estimated Value": [f"{p:.2f}" for p in preds]
                 })
-
-
 
                 # RADAR CHART IMPLEMENTATION - REPLACES GAUGE CHARTS
                 # Collect all data for radar chart
@@ -1548,19 +1560,20 @@ def explore_uploaded_results():
 
             # Export button for filtered solutions from uploaded data
             if len(filtered_df) > 0:
-                export_path = st.text_input("Export filtered solutions to:",
-                                            value="uploaded_filtered_solutions.xlsx",
-                                            key="explorer_export_path")
+                # Convert DataFrame to Excel bytes for download
+                from io import BytesIO
+                excel_buffer = BytesIO()
+                filtered_df.to_excel(excel_buffer, index=False, engine='openpyxl')
+                excel_data = excel_buffer.getvalue()
 
-                if st.button("Export Filtered Solutions", key="explorer_export_btn", use_container_width=True):
-                    try:
-                        if export_path.endswith(".xlsx"):
-                            filtered_df.to_excel(export_path, index=False)
-                        else:
-                            filtered_df.to_csv(export_path, index=False)
-                        st.success(f"Filtered solutions exported to {export_path}")
-                    except Exception as e:
-                        st.error(f"Error exporting filtered solutions: {e}")
+                st.download_button(
+                    label="Export Filtered Solutions",
+                    data=excel_data,
+                    file_name="uploaded_filtered_solutions.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    key="explorer_export_btn",
+                    use_container_width=True
+                )
 
         except Exception as e:
             st.error(f"Error in All Computed Solutions section: {e}")
@@ -1577,9 +1590,12 @@ def main():
         # Sidebar for configuration
         with st.sidebar.expander("Setup", expanded=False):
             st.header("Setup")
-            n_estimators = st.slider("Number of Trees in Random Forest", min_value=10, max_value=200, value=50,help="Only change if you are sure what you are doing")
-            cv_folds = st.slider("Cross-Validation Folds", min_value=3, max_value=10, value=5,help="Only change if you are sure what you are doing")
-            st.session_state['num_cores'] = st.slider("Number of CPU Cores", min_value=1, max_value=16, value=8, help="Only change if you are sure what you are doing")
+            n_estimators = st.slider("Number of Trees in Random Forest", min_value=10, max_value=200, value=50,
+                                     help="Only change if you are sure what you are doing")
+            cv_folds = st.slider("Cross-Validation Folds", min_value=3, max_value=10, value=5,
+                                 help="Only change if you are sure what you are doing")
+            st.session_state['num_cores'] = st.slider("Number of CPU Cores", min_value=1, max_value=16, value=8,
+                                                      help="Only change if you are sure what you are doing")
 
         # Create tabs for Training, Results and Explorer
         tab1, tab2, tab3 = st.tabs(["Training", "Results", "Explorer"])
@@ -1716,7 +1732,6 @@ def main():
         st.error(f"An error occurred in the main function: {e}")
         import traceback
         st.code(traceback.format_exc())
-
 
 
 if __name__ == "__main__":
