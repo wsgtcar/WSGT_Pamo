@@ -21,24 +21,14 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import matplotlib.cm as cm
 
 
-# --- Poly(deg=2)+Ridge helpers (PAMO 1.1.9) ---
-
-def _alpha_from_n_estimators(n_estimators: int) -> float:
-    """Map the existing 'Number of Trees' slider to a Ridge alpha, without changing the UI."""
-    # More 'trees' -> lower regularization (more flexible fit)
-    try:
-        n = float(max(1, int(n_estimators)))
-    except Exception:
-        n = 50.0
-    return max(0.001, 10.0 / n)  # e.g., 100 -> 0.10 ; 50 -> 0.20 ; 10 -> 1.00
-
+# --- Poly(deg=2)+Ridge helpers (PAMO 1.1.10) ---
 
 def build_poly2_ridge(alpha: float) -> Pipeline:
     """Create a Poly(deg=2)+Scaler+Ridge pipeline that predicts a single objective."""
     return Pipeline([
         ("poly", PolynomialFeatures(degree=2, include_bias=False)),
         ("scaler", StandardScaler()),
-        ("ridge", Ridge(alpha=alpha))
+        ("ridge", Ridge(alpha=float(alpha)))
     ])
 
 
@@ -86,7 +76,6 @@ def compute_param_sensitivity_from_poly_ridge(model: Pipeline, base_feature_name
     except Exception:
         return np.zeros(len(base_feature_names), dtype=float)
 
-
 st.set_page_config(
     initial_sidebar_state="collapsed",  # Optional
     page_title="WSGT_PAMO Machine Learning",
@@ -96,7 +85,7 @@ st.set_page_config(
 
 st.sidebar.image("Pamo_Icon_Black.png", width=80)
 st.sidebar.write("## WSGT_PAMO")
-st.sidebar.write("Version 1.0.0")
+st.sidebar.write("Version 1.1.10")
 st.sidebar.markdown("---")
 
 col1, col2 = st.columns(2)
@@ -140,7 +129,7 @@ def load_data(num_objectives):
 
 # Function to preprocess data and train model with cross-validation
 @st.cache_data
-def preprocess_and_train_with_cv(_df, num_objectives, n_estimators=50, cv_folds=5):
+def preprocess_and_train_with_cv(_df, num_objectives, ridge_alpha=0.1, cv_folds=5):
     """
     Preprocess data and train one model per objective using:
       Poly(deg=2) + StandardScaler + Ridge
@@ -166,7 +155,7 @@ def preprocess_and_train_with_cv(_df, num_objectives, n_estimators=50, cv_folds=
         feature_importances = []  # parameter-level sensitivities (keeps existing UI)
         objective_uncertainties = []  # std of CV residuals per objective (keeps uncertainty outputs)
 
-        alpha = _alpha_from_n_estimators(n_estimators)
+        alpha = float(ridge_alpha)
 
         # For each objective
         for i, y_i in enumerate(y):
@@ -464,9 +453,11 @@ def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights,
 
         st.write(f"Total parameter combinations to evaluate: {total_combinations}")
 
-        # Use limited threads for Streamlit Cloud compatibility
-        num_cores = min(st.session_state.get('num_cores', 8), 4)  # Max 2 threads
-        st.write(f"Using {num_cores} threads for processing (Streamlit Cloud optimized)")
+        # Threads for parallel evaluation (caps to available CPU cores)
+        requested_cores = int(st.session_state.get('num_cores', 8))
+        available_cores = os.cpu_count() or requested_cores
+        num_cores = max(1, min(requested_cores, available_cores))
+        st.write(f"Using {num_cores} threads for processing (requested: {requested_cores}, available: {available_cores})")
 
         # Calculate optimal batch size for Streamlit Cloud (smaller batches for stability)
         if total_combinations < 1000:
@@ -1439,7 +1430,7 @@ def explore_uploaded_results():
 
                 # Train a model for each objective
                 for i, y_i in enumerate(y_train):
-                    alpha = _alpha_from_n_estimators(100)
+                    alpha = float(st.session_state.get('ridge_alpha', 0.1))
                     model = build_poly2_ridge(alpha=alpha)
                     model.fit(X_train, y_i)
                     models.append(model)
@@ -1692,8 +1683,9 @@ def main():
         # Sidebar for configuration
         with st.sidebar.expander("Setup", expanded=False):
             st.header("Setup")
-            n_estimators = st.slider("Number of Trees in Random Forest", min_value=10, max_value=200, value=50,
-                                     help="Only change if you are sure what you are doing")
+            ridge_alpha = st.slider("Ridge alpha (regularization)", min_value=0.001, max_value=10.0, value=0.1, step=0.001,
+                                     format="%.3f", help="Higher alpha = more regularization (smoother model).")
+            st.session_state['ridge_alpha'] = float(ridge_alpha)
             cv_folds = st.slider("Cross-Validation Folds", min_value=3, max_value=10, value=5,
                                  help="Only change if you are sure what you are doing")
             st.session_state['num_cores'] = st.slider("Number of CPU Cores", min_value=1, max_value=16, value=8,
@@ -1742,7 +1734,7 @@ def main():
                 y = [df[col] for col in df.columns[-num_objectives:]]
                 objective_names = df.columns[-num_objectives:].tolist()
 
-                models, param_names, objective_names = preprocess_and_train_with_cv(df, num_objectives, n_estimators,
+                models, param_names, objective_names = preprocess_and_train_with_cv(df, num_objectives, ridge_alpha,
                                                                                     cv_folds)
 
                 if models and y:
