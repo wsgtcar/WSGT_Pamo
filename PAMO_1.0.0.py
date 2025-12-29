@@ -6,8 +6,11 @@ from deap import base, creator, tools
 import itertools
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import PolynomialFeatures, StandardScaler
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import Ridge, RidgeCV
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.model_selection import KFold, cross_val_score, cross_val_predict, learning_curve
+from sklearn.metrics import r2_score, mean_absolute_error
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
 import plotly.express as px
@@ -15,13 +18,41 @@ import time
 import os
 import pickle
 import tempfile
+from typing import Optional
 from functools import partial
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import matplotlib.cm as cm
 
 
-# --- Poly(deg=2)+Ridge helpers (PAMO 1.1.10) ---
+# --- Data signature helper (for reliable caching) ---
+def compute_df_signature(df) -> str:
+    """Return a stable hash for a pandas DataFrame content + columns.
+
+    This is used to make Streamlit caching invalidate correctly when the uploaded
+    training data changes.
+    """
+    try:
+        import pandas as _pd
+        import numpy as _np
+        h = _pd.util.hash_pandas_object(df, index=True).values
+        # also include columns + dtypes
+        meta = (tuple(map(str, df.columns)), tuple(map(str, df.dtypes)))
+        meta_bytes = str(meta).encode('utf-8', errors='ignore')
+        import hashlib
+        m = hashlib.sha256()
+        m.update(h.tobytes())
+        m.update(meta_bytes)
+        return m.hexdigest()
+    except Exception:
+        try:
+            # Fallback: shape + columns only
+            return f"fallback:{df.shape}:{tuple(map(str, df.columns))}"
+        except Exception:
+            return 'fallback:unknown'
+
+
+# --- Poly(deg=2)+Ridge helpers (PAMO 1.1.14) ---
 
 def build_poly2_ridge(alpha: float) -> Pipeline:
     """Create a Poly(deg=2)+Scaler+Ridge pipeline that predicts a single objective."""
@@ -30,6 +61,160 @@ def build_poly2_ridge(alpha: float) -> Pipeline:
         ("scaler", StandardScaler()),
         ("ridge", Ridge(alpha=float(alpha)))
     ])
+
+
+def build_poly2_ridgecv(alphas) -> Pipeline:
+    """Create a Poly(deg=2)+Scaler+RidgeCV(alphas) pipeline (single objective)."""
+    alphas = [float(a) for a in alphas]
+    return Pipeline([
+        ("poly", PolynomialFeatures(degree=2, include_bias=False)),
+        ("scaler", StandardScaler()),
+        # cv=None -> efficient generalized CV inside each training fold (no leakage)
+        ("ridge", RidgeCV(alphas=alphas, cv=None))
+    ])
+
+
+class RidgeSurrogate:
+    """Wrapper to provide predict() + predict_uncertainty() with constant sigma_floor."""
+
+    def __init__(self, model: Pipeline, sigma_floor: float = 0.0, chosen_alpha: Optional[float] = None):
+        self.model = model
+        self.sigma_floor = float(sigma_floor)
+        self.chosen_alpha = float(chosen_alpha) if chosen_alpha is not None else None
+        self.kind = "Ridge"
+
+    def predict(self, X):
+        return np.asarray(self.model.predict(np.asarray(X)))
+
+    def predict_uncertainty(self, X):
+        n = len(np.asarray(X))
+        return np.full(n, self.sigma_floor, dtype=float)
+
+
+class RandomForestSurrogate:
+    """Wrapper to provide predict() + predict_uncertainty() for RF with tree-std + sigma_floor."""
+
+    def __init__(self, model: RandomForestRegressor, sigma_floor: float = 0.0):
+        self.model = model
+        self.sigma_floor = float(sigma_floor)
+        self.kind = "Random Forest"
+
+    def predict(self, X):
+        return np.asarray(self.model.predict(np.asarray(X)))
+
+    def predict_uncertainty(self, X):
+        X_arr = np.asarray(X)
+        rf_std = 0.0
+        if hasattr(self.model, "estimators_"):
+            try:
+                tree_preds = np.vstack([est.predict(X_arr) for est in self.model.estimators_])
+                rf_std = np.std(tree_preds, axis=0)
+            except Exception:
+                rf_std = 0.0
+        return np.sqrt(self.sigma_floor ** 2 + np.asarray(rf_std) ** 2)
+
+
+
+class HybridEstimator(BaseEstimator, RegressorMixin):
+    """sklearn-compatible estimator for the Hybrid surrogate.
+
+    Hybrid model: y = Ridge(Poly2(x)) + RF_residual(x)
+    """
+
+    def __init__(
+        self,
+        ridge_alpha: float = 0.1,
+        ridge_alphas: tuple = (0.001, 0.01, 0.1, 1.0, 10.0),
+        ridge_auto: bool = True,
+        rf_n_estimators: int = 150,
+        rf_min_samples_leaf: int = 2,
+        rf_max_depth=None,
+        rf_max_features: str = "sqrt",
+        n_jobs=None,
+    ):
+        # Store parameters exactly as passed for sklearn.clone compatibility
+        self.ridge_alpha = ridge_alpha
+        self.ridge_alphas = ridge_alphas
+        self.ridge_auto = ridge_auto
+        self.rf_n_estimators = rf_n_estimators
+        self.rf_min_samples_leaf = rf_min_samples_leaf
+        self.rf_max_depth = rf_max_depth
+        self.rf_max_features = rf_max_features
+        self.n_jobs = n_jobs
+
+        self._ridge_model = None
+        self._rf_model = None
+
+    def fit(self, X, y):
+        import numpy as np
+        X = np.asarray(X)
+        y = np.asarray(y, dtype=float)
+
+        if self.ridge_auto:
+            self._ridge_model = build_poly2_ridgecv(self.ridge_alphas)
+        else:
+            self._ridge_model = build_poly2_ridge(self.ridge_alpha)
+
+        self._ridge_model.fit(X, y)
+        resid = y - self._ridge_model.predict(X)
+
+        n_jobs = None if self.n_jobs is None else int(self.n_jobs)
+
+        self._rf_model = RandomForestRegressor(
+            n_estimators=int(self.rf_n_estimators),
+            random_state=42,
+            n_jobs=n_jobs,
+            max_features=self.rf_max_features,
+            max_depth=self.rf_max_depth,
+            min_samples_leaf=int(self.rf_min_samples_leaf),
+        )
+        self._rf_model.fit(X, resid)
+        return self
+
+    def predict(self, X):
+        import numpy as np
+        X = np.asarray(X)
+        ridge_pred = self._ridge_model.predict(X)
+        rf_pred = self._rf_model.predict(X)
+        return ridge_pred + rf_pred
+
+
+class HybridSurrogate:
+
+    """
+    Hybrid surrogate model:
+      y_hat(x) = ridge_poly2(x) + rf_residual(x)
+
+    Uncertainty:
+      - sigma_floor: constant per objective (estimated from CV residuals of the hybrid model)
+      - rf_std(x): std across residual RF trees (local epistemic proxy)
+      - sigma_total(x) = sqrt(sigma_floor^2 + rf_std(x)^2)
+    """
+
+    def __init__(self, ridge_model: Pipeline, rf_residual_model: RandomForestRegressor, sigma_floor: float = 0.0):
+        self.ridge_model = ridge_model
+        self.rf_residual_model = rf_residual_model
+        self.sigma_floor = float(sigma_floor)
+
+    def predict(self, X):
+        X_arr = np.asarray(X)
+        base = np.asarray(self.ridge_model.predict(X_arr))
+        if self.rf_residual_model is None:
+            return base
+        corr = np.asarray(self.rf_residual_model.predict(X_arr))
+        return base + corr
+
+    def predict_uncertainty(self, X):
+        X_arr = np.asarray(X)
+        rf_std = 0.0
+        if self.rf_residual_model is not None and hasattr(self.rf_residual_model, "estimators_"):
+            try:
+                tree_preds = np.vstack([est.predict(X_arr) for est in self.rf_residual_model.estimators_])
+                rf_std = np.std(tree_preds, axis=0)
+            except Exception:
+                rf_std = 0.0
+        return np.sqrt(self.sigma_floor ** 2 + np.asarray(rf_std) ** 2)
+
 
 
 def compute_param_sensitivity_from_poly_ridge(model: Pipeline, base_feature_names) -> np.ndarray:
@@ -86,6 +271,7 @@ st.set_page_config(
 st.sidebar.image("Pamo_Icon_Black.png", width=80)
 st.sidebar.write("## WSGT_PAMO")
 st.sidebar.write("Version 1.1.10")
+st.sidebar.write("Dynamic Solver + Cache")
 st.sidebar.markdown("---")
 
 col1, col2 = st.columns(2)
@@ -111,6 +297,32 @@ def create_individual_class(num_objectives, weights):
     creator.create("Individual", list, fitness=create_fitness_class(num_objectives, weights), uncertainty=list)
 
 
+# Generate parameter combinations - lazy evaluation
+def parameter_combinations_generator(param_ranges):
+    """Generate parameter combinations on-demand without storing all in memory.
+
+    param_ranges: dict {param_name: (min_val, max_val, step)}
+    Returns: (generator, total_combinations)
+    """
+    param_values = []
+    for min_val, max_val, step in param_ranges.values():
+        if float(min_val) == float(max_val):
+            param_values.append([float(min_val)])
+        else:
+            min_val = float(min_val)
+            max_val = float(max_val)
+            step = float(step)
+            if step <= 0:
+                param_values.append([min_val])
+            else:
+                param_values.append(np.arange(min_val, max_val + step / 2.0, step))
+
+    total_combinations = 1
+    for values in param_values:
+        total_combinations *= len(values)
+
+    return itertools.product(*param_values), total_combinations
+
 # Function to load data from Excel file
 def load_data(num_objectives):
     uploaded_file = st.file_uploader("Upload Training Data Excel file", type=["xlsx"])
@@ -127,177 +339,91 @@ def load_data(num_objectives):
     return None
 
 
-# Function to preprocess data and train model with cross-validation
-@st.cache_data
-def preprocess_and_train_with_cv(_df, num_objectives, ridge_alpha=0.1, cv_folds=5):
-    """
-    Preprocess data and train one model per objective using:
-      Poly(deg=2) + StandardScaler + Ridge
+# (preprocess_and_train_with_cv is defined later with per-objective auto model selection)
 
-    Notes:
-    - The UI remains unchanged (we keep 'n_estimators' argument from the existing slider).
-      Internally we map it to Ridge's alpha (regularization strength).
-    - We keep the same expected outputs:
-      * list of trained models (one per objective)
-      * parameter names
-      * objective names
-      * per-objective uncertainty values are stored in session_state for downstream optimization output
+
+def visualize_model_performance(X, y, estimators, objective_names, cv_folds=5):
+    """
+    Plot learning curves (R²) for each objective.
+
+    Why this sometimes failed on Windows/Streamlit:
+      - sklearn.learning_curve uses joblib for parallel CV when n_jobs > 1.
+      - In some Windows/Streamlit setups, process-based parallelism can raise OSError: [Errno 22] Invalid argument.
+    Mitigation:
+      - Prefer a thread-based backend for learning curves.
+      - If it still fails, fall back to single-thread execution.
     """
     try:
-        X = _df.drop(_df.columns[-num_objectives:], axis=1)
-        y = [_df[col] for col in _df.columns[-num_objectives:]]
-
-        # Define cross-validation strategy
-        cv = KFold(n_splits=min(cv_folds, len(X)), shuffle=True, random_state=42)
-
-        models = []
-        cv_scores = []
-        feature_importances = []  # parameter-level sensitivities (keeps existing UI)
-        objective_uncertainties = []  # std of CV residuals per objective (keeps uncertainty outputs)
-
-        alpha = float(ridge_alpha)
-
-        # For each objective
-        for i, y_i in enumerate(y):
-            # Initialize model (single-output)
-            model = build_poly2_ridge(alpha=alpha)
-
-            # Perform cross-validation (R²)
-            scores = cross_val_score(model, X, y_i, cv=cv, scoring='r2')
-            cv_scores.append(scores)
-
-            # Estimate a simple uncertainty metric from cross-validated residuals
-            try:
-                y_pred_cv = cross_val_predict(model, X, y_i, cv=cv)
-                resid = np.asarray(y_i) - np.asarray(y_pred_cv)
-                obj_unc = float(np.std(resid)) if len(resid) > 1 else 0.0
-            except Exception:
-                obj_unc = 0.0
-            objective_uncertainties.append(obj_unc)
-
-            # Train final model on all data
-            model.fit(X, y_i)
-            models.append(model)
-
-            # Store parameter-level sensitivities from polynomial coefficients
-            sens = compute_param_sensitivity_from_poly_ridge(model, X.columns)
-            feature_importances.append(sens)
-
-            # Print cross-validation results
-            st.write(
-                f"Objective {i + 1} ({_df.columns[-num_objectives + i]}) - Cross-validation R² scores: "
-                f"{[f'{s:.2f}' for s in scores]}"
-            )
-            st.write(f"Mean R²: {np.mean(scores):.2f} (±{np.std(scores):.2f})")
-            st.write(f"Estimated uncertainty (CV residual std): {obj_unc:.2f}")
-
-        # Visualize cross-validation results
-        if cv_scores:
-            fig, ax = plt.subplots(figsize=(10, 6), frameon=False)
-            ax.boxplot(cv_scores)
-            ax.set_xticklabels([f"{_df.columns[-num_objectives + i]}" for i in range(len(y))], rotation=45, ha='right')
-            ax.set_ylabel("R² Score")
-            ax.set_title("Cross-Validation Performance by Objective")
-            ax.grid(True, linestyle='--', alpha=0.7)
-            plt.tight_layout()
-            st.pyplot(fig)
-
-        # Visualize feature sensitivity (parameter-level, preserves existing plots)
-        if feature_importances:
-            fig, axes = plt.subplots(1, len(y), figsize=(15, 5), sharey=False, frameon=False)
-            if len(y) == 1:
-                axes = [axes]
-
-            for i, (importances, ax) in enumerate(zip(feature_importances, axes)):
-                importances = np.asarray(importances, dtype=float)
-
-                # Sort indices by importance
-                sorted_indices = np.argsort(importances)
-                sorted_importances = importances[sorted_indices]
-                sorted_names = X.columns[sorted_indices]
-
-                # Create horizontal bars with color gradient
-                colors = cm.RdYlGn_r(sorted_importances / max(sorted_importances) if max(sorted_importances) > 0 else 0)
-
-                # Plot horizontal bars
-                y_pos = np.arange(len(sorted_indices))
-                ax.barh(y_pos, sorted_importances, color=colors)
-                ax.set_yticks(y_pos)
-                ax.set_yticklabels(sorted_names)
-                ax.set_title(f"Sensitivity - {_df.columns[-num_objectives + i]}")
-                ax.grid(True, linestyle='--', alpha=0.7)
-            plt.tight_layout()
-            st.pyplot(fig)
-
-        # Store models and uncertainties in session state (used by optimization)
-        st.session_state['models'] = models
-        st.session_state['objective_uncertainties'] = objective_uncertainties
-
-        # Test prediction with a sample
-        if X.shape[0] > 0:
-            sample = X.iloc[0].values
-            st.write("### Testing Model Predictions")
-            st.write(f"Sample input: {sample}")
-
-            for i, model in enumerate(models):
-                pred = model.predict([sample])[0]
-                st.write(f"Model {i + 1} prediction: {pred:.2f}")
-
-        return models, X.columns, _df.columns[-num_objectives:]
-
-    except Exception as e:
-        st.error(f"Error in model training: {e}")
-        import traceback
-        st.code(traceback.format_exc())
-        return [], [], []
-
-
-# Visualize model performance with learning curves
-@st.cache_data
-def visualize_model_performance(X, y, _models, objective_names, cv_folds=5):
-    try:
-        # Ensure we have models to visualize
-        if not _models or not y:
+        if X is None or y is None or not estimators:
             st.warning("No models or data available for learning curves.")
             return
 
-        # Create a figure for learning curves (without frame)
-        fig, axes = plt.subplots(1, len(y), figsize=(15, 5), frameon=False)
-        if len(y) == 1:
+        # y is expected as list/array of per-objective vectors
+        n_obj = len(y)
+        if n_obj == 0:
+            st.warning("No objectives available for learning curves.")
+            return
+
+        fig, axes = plt.subplots(1, n_obj, figsize=(4.2 * n_obj, 4.2), frameon=False)
+        if n_obj == 1:
             axes = [axes]
 
-        # Adjust cv_folds if necessary
-        cv_folds = min(cv_folds, len(X))
+        # CV folds cannot exceed the sample count
+        cv_folds_int = int(cv_folds) if cv_folds is not None else 5
+        cv_folds_int = min(max(2, cv_folds_int), len(X))
 
-        # For each objective
-        for i, (y_i, model, ax, obj_name) in enumerate(zip(y, _models, axes, objective_names)):
+        # Training sizes: fractions are OK; keep count small for speed
+        train_sizes = np.linspace(0.2, 1.0, min(8, max(2, len(X))))
+
+        # Use thread backend to avoid Windows process-spawn issues inside Streamlit
+        n_jobs_req = max(1, int(st.session_state.get('num_cores', 1)))
+
+        from joblib import parallel_backend
+
+        for i, (y_i, est, ax, obj_name) in enumerate(zip(y, estimators, axes, objective_names)):
             try:
-                # Split data for plotting learning curve
-                train_sizes, train_scores, test_scores = learning_curve(
-                    model, X, y_i, cv=cv_folds, n_jobs=-1,
-                    train_sizes=np.linspace(0.1, 1.0, min(10, len(X))),
-                    scoring='r2'
+                with parallel_backend("threading", n_jobs=n_jobs_req):
+                    ts, train_scores, test_scores = learning_curve(
+                        est,
+                        X,
+                        y_i,
+                        cv=cv_folds_int,
+                        n_jobs=n_jobs_req,
+                        train_sizes=train_sizes,
+                        scoring="r2"
+                    )
+            except Exception:
+                # Fall back to single-threaded execution as a last resort
+                ts, train_scores, test_scores = learning_curve(
+                    est,
+                    X,
+                    y_i,
+                    cv=cv_folds_int,
+                    n_jobs=1,
+                    train_sizes=train_sizes,
+                    scoring="r2"
                 )
 
-                # Calculate mean and std
+            try:
                 train_mean = np.mean(train_scores, axis=1)
                 train_std = np.std(train_scores, axis=1)
                 test_mean = np.mean(test_scores, axis=1)
                 test_std = np.std(test_scores, axis=1)
 
-                # Plot learning curve
-                ax.plot(train_sizes, train_mean, 'o-', color='r', label='Training score')
-                ax.fill_between(train_sizes, train_mean - train_std, train_mean + train_std, alpha=0.1, color='r')
-                ax.plot(train_sizes, test_mean, 'o-', color='g', label='Cross-validation score')
-                ax.fill_between(train_sizes, test_mean - test_std, test_mean + test_std, alpha=0.1, color='g')
-                ax.set_title(f'Learning Curve - {obj_name}')
-                ax.set_xlabel('Training Examples')
-                ax.set_ylabel('R² Score')
-                ax.legend(loc='best')
-                ax.grid(True, linestyle='--', alpha=0.7)
+                ax.plot(ts, train_mean, marker="o", label="Training R²")
+                ax.fill_between(ts, train_mean - train_std, train_mean + train_std, alpha=0.15)
+
+                ax.plot(ts, test_mean, marker="o", label="CV R²")
+                ax.fill_between(ts, test_mean - test_std, test_mean + test_std, alpha=0.15)
+
+                ax.set_title(f"Learning Curve - {obj_name}")
+                ax.set_xlabel("Training samples")
+                ax.set_ylabel("R²")
+                ax.grid(True, linestyle="--", alpha=0.5)
+                ax.legend(loc="best", fontsize=8)
             except Exception as e:
-                ax.text(0.5, 0.5, f"Error: {str(e)}", ha='center', va='center')
-                ax.set_title(f'Learning Curve - {obj_name} (Error)')
+                ax.text(0.5, 0.5, f"Plot error: {str(e)}", ha="center", va="center")
+                ax.set_title(f"Learning Curve - {obj_name} (Plot error)")
 
         plt.tight_layout()
         st.pyplot(fig)
@@ -306,46 +432,29 @@ def visualize_model_performance(X, y, _models, objective_names, cv_folds=5):
         st.error(f"Error visualizing learning curves: {e}")
 
 
-# Generator function for parameter combinations - lazy evaluation
-def parameter_combinations_generator(param_ranges):
-    """Generate parameter combinations on-demand without storing all in memory"""
-    # Extract parameter values
-    param_values = []
-    for min_val, max_val, step in param_ranges.values():
-        # Handle case where min == max
-        if min_val == max_val:
-            param_values.append([min_val])
-        else:
-            param_values.append(
-                np.arange(min_val, max_val + step / 2, step))  # Add step/2 to avoid floating point issues
-
-    # Calculate total combinations without generating them
-    total_combinations = 1
-    for values in param_values:
-        total_combinations *= len(values)
-
-    # Return generator and total count
-    return itertools.product(*param_values), total_combinations
-
-
-# Optimized function to evaluate a batch of parameter combinations
 def evaluate_batch(batch_params, models, num_objectives, objective_uncertainties=None):
     results = []
 
     for params in batch_params:
-        # Convert params to numpy array for prediction
         params_array = np.array([params])
 
-        # Get predictions and uncertainties for all models
         predictions = []
         uncertainties = []
 
         for obj_idx, model in enumerate(models):
-            # Poly(deg=2)+Ridge: direct prediction
-            pred_val = float(model.predict(params_array)[0])
+            # Prediction
+            try:
+                pred_val = float(model.predict(params_array)[0])
+            except Exception:
+                pred_val = 0.0
 
-            # Uncertainty: use per-objective CV residual std (constant per objective)
-            if objective_uncertainties is not None and obj_idx < len(objective_uncertainties):
+            # Uncertainty: hybrid if available; fallback to constant list
+            if hasattr(model, "predict_uncertainty"):
+                try:
+                    unc_val = float(np.asarray(model.predict_uncertainty(params_array))[0])
+                except Exception:
+                    unc_val = 0.0
+            elif objective_uncertainties is not None and obj_idx < len(objective_uncertainties):
                 unc_val = float(objective_uncertainties[obj_idx])
             else:
                 unc_val = 0.0
@@ -366,11 +475,9 @@ def evaluate_batch(batch_params, models, num_objectives, objective_uncertainties
             else:
                 uncertainties = uncertainties[:num_objectives]
 
-        # Format for display
         rounded_fitness = [f"{float(fit_val):.2f}" for fit_val in predictions]
         rounded_uncertainty = [f"{float(unc_val):.2f}" for unc_val in uncertainties]
 
-        # Add to results
         results.append({
             'params': params,
             'predictions': predictions,
@@ -382,7 +489,6 @@ def evaluate_batch(batch_params, models, num_objectives, objective_uncertainties
     return results
 
 
-# Helper function to process completed async results
 def process_completed_results(async_results, hof, temp_results_file,
                               processed_count, total_combinations,
                               progress_bar, status_text, start_time):
@@ -438,7 +544,7 @@ def process_completed_results(async_results, hof, temp_results_file,
 
 # Function to perform streaming optimization with optimized parallel processing
 @st.cache_resource
-def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights, output_path, objective_names, objective_uncertainties=None):
+def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights, output_path, objective_names, objective_uncertainties=None, models_signature: str = "", num_cores: int = 1):
     try:
         st.write("Starting optimization process with streaming parallel processing...")
         progress_bar = st.progress(0)
@@ -454,18 +560,1211 @@ def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights,
         st.write(f"Total parameter combinations to evaluate: {total_combinations}")
 
         # Threads for parallel evaluation (caps to available CPU cores)
-        requested_cores = int(st.session_state.get('num_cores', 8))
+        requested_cores = int(num_cores) if num_cores is not None else int(st.session_state.get('num_cores', 8))
         available_cores = os.cpu_count() or requested_cores
         num_cores = max(1, min(requested_cores, available_cores))
         st.write(f"Using {num_cores} threads for processing (requested: {requested_cores}, available: {available_cores})")
 
         # Calculate optimal batch size for Streamlit Cloud (smaller batches for stability)
         if total_combinations < 1000:
-            batch_size = max(1, min(100, total_combinations // 10))
+            batch_size = max(1, min(250, total_combinations // 10))
         elif total_combinations < 10000:
-            batch_size = max(5, min(250, total_combinations // 20))
+            batch_size = max(5, min(500, total_combinations // 20))
         else:
-            batch_size = max(10, min(500, total_combinations // 50))  # Much smaller batches for large datasets
+            batch_size = max(10, min(1000, total_combinations // 50))  # Much smaller batches for large datasets
+
+        st.write(f"Using adaptive batch size: {batch_size}")
+
+        # Prepare for streaming processing
+        processed_count = 0
+        batch_count = 0
+
+        # Prepare column labels for the DataFrame
+        param_labels = list(param_ranges.keys())
+        fitness_labels = list(objective_names)
+        uncertainty_labels = [f'Uncertainty_{name}' for name in objective_names]
+
+        # Create DataFrame for results with chunked writing
+        df_columns = param_labels + fitness_labels + uncertainty_labels
+
+        # Create a temporary file for results
+        temp_results_file = "temp_results.csv"
+        with open(temp_results_file, 'w') as f:
+            # Write header
+            f.write(','.join(df_columns) + '\n')
+
+        # Create a pool of worker threads (more Streamlit-friendly than processes)
+        with ThreadPoolExecutor(max_workers=num_cores) as executor:
+            # Use a queue of async results to maximize CPU utilization
+            async_results = []
+            batches = []
+            current_batch = []
+
+            # Process parameter combinations in streaming batches
+            for i, params in enumerate(param_generator):
+                current_batch.append(params)
+
+                # When batch is full, submit it asynchronously
+                if len(current_batch) >= batch_size:
+                    batch_count += 1
+                    batches.append(current_batch)
+
+                    # Submit batch for async processing
+                    future = executor.submit(evaluate_batch, current_batch, _models, num_objectives, objective_uncertainties)
+                    async_results.append((future, len(current_batch)))
+
+                    # Reset current batch
+                    current_batch = []
+
+                # Process completed results to free up memory
+                processed_count = process_completed_results(
+                    async_results, hof, temp_results_file,
+                    processed_count, total_combinations,
+                    progress_bar, status_text, start_time
+                )
+
+                # Periodic memory cleanup and progress check
+                if i % 100 == 0:
+                    import gc
+                    gc.collect()
+            # Submit any remaining combinations
+            if current_batch:
+                batch_count += 1
+                batches.append(current_batch)
+
+                # Submit batch for async processing
+                future = executor.submit(evaluate_batch, current_batch, _models, num_objectives, objective_uncertainties)
+                async_results.append((future, len(current_batch)))
+
+            # Wait for all remaining results to complete
+            while async_results:
+                processed_count = process_completed_results(
+                    async_results, hof, temp_results_file,
+                    processed_count, total_combinations,
+                    progress_bar, status_text, start_time
+                )
+                time.sleep(0.1)  # Short sleep to prevent CPU spinning
+
+        # Complete progress bar
+        progress_bar.progress(1.0)
+
+        # Read results from temporary file
+        results_df = pd.read_csv(temp_results_file, encoding='latin-1')
+
+        # Calculate weighted sum for each solution
+        if 'Weighted Sum' not in results_df.columns:
+            # Normalize and calculate weighted sum
+            weighted_sum = np.zeros(len(results_df))
+            for i, (obj, w) in enumerate(zip(fitness_labels, weights)):
+                col_values = results_df[obj].astype(float)
+                v_min = col_values.min()
+                v_max = col_values.max()
+
+                if v_max == v_min:
+                    normalized = np.zeros_like(col_values)
+                elif w < 0:
+                    normalized = w * (v_max - col_values) / (v_max - v_min)
+                else:
+                    normalized = w * (col_values - v_min) / (v_max - v_min)
+
+                weighted_sum += normalized
+
+            results_df['Weighted Sum'] = weighted_sum
+            for ind, wsum in zip(hof, weighted_sum):
+                ind.weighted_sum = wsum
+
+        # Save results to Excel file if not too large
+        try:
+            if len(results_df) <= 1048576:  # Excel row limit
+                results_df.to_excel(output_path, index=False)
+                st.success(f"Results saved to {output_path}")
+                # Store the output path in session state for later use
+                st.session_state['output_path'] = output_path
+            else:
+                csv_path = output_path.replace('.xlsx', '.csv')
+                results_df.to_csv(csv_path, index=False)
+                st.warning(f"Results too large for Excel. Saved to {csv_path} instead.")
+                # Store the CSV path in session state for later use
+                st.session_state['output_path'] = csv_path
+        except Exception as e:
+            st.error(f"Error saving results: {e}")
+            # Fallback to CSV
+            try:
+                csv_path = output_path.replace('.xlsx', '.csv')
+                results_df.to_csv(csv_path, index=False)
+                st.success(f"Results saved to {csv_path}")
+                # Store the CSV path in session state for later use
+                st.session_state['output_path'] = csv_path
+            except:
+                st.error("Failed to save results to file.")
+
+        # Clean up temporary file
+        try:
+            os.remove(temp_results_file)
+        except:
+            pass
+
+        # Display optimization summary
+        st.write(f"Optimization completed in {time.time() - start_time:.2f} seconds")
+        st.write(f"Evaluated {processed_count} parameter combinations")
+        st.write(f"Found {len(hof)} solutions on the Pareto front")
+
+        return hof
+
+    except Exception as e:
+        st.error(f"Error in optimization: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+        return None
+
+
+# Helper function to normalize weighted sum consistently
+def normalize_weighted_sum(objective_values, weights):
+    """Calculate normalized weighted sum for given objective values and weights"""
+    weighted_sum = 0.0
+
+    for i, (obj_vals, w) in enumerate(zip(objective_values.T, weights)):
+        v_min = obj_vals.min()
+        v_max = obj_vals.max()
+
+        if v_max == v_min:
+            normalized = np.zeros_like(obj_vals)
+        elif w < 0:
+            normalized = w * (v_max - obj_vals) / (v_max - v_min)
+        else:
+            normalized = w * (obj_vals - v_min) / (v_max - v_min)
+
+        weighted_sum += normalized
+
+    return weighted_sum
+
+
+# Helper function to create dimension for parallel coordinates plot with non-overlapping tick labels
+def create_dimension(label, values, min_val, max_val):
+    """Create a dimension for parallel coordinates with clean tick labels"""
+    # Let Plotly handle tick positioning automatically for better readability
+    # Only specify range and let Plotly determine optimal tick positions
+    if min_val == max_val:
+        # Handle edge case where all values are the same
+        return dict(
+            range=[min_val - 0.1, max_val + 0.1],
+            label=label,
+            values=values
+        )
+    else:
+        return dict(
+            range=[min_val, max_val],
+            label=label,
+            values=values
+        )
+
+
+# Visualize Pareto front using Plotly for interactivity
+def visualize_pareto_front(hof, objective_names_list, param_names_list, weights):
+    try:
+        # Ensure objective_names_list and param_names_list are lists
+        objective_names_list = list(objective_names_list)
+        param_names_list = list(param_names_list)
+
+        # Extract objective values for all solutions
+        objective_values = np.array([list(ind.fitness.values) for ind in hof])
+
+        # Calculate weighted sum for each solution
+        weighted_sums = np.array([ind.weighted_sum for ind in hof])
+
+        # Create a DataFrame for the parallel coordinates plot
+        data = []
+        for i, ind in enumerate(hof):
+            solution_data = {}
+            # Add parameter values
+            for j, param_name in enumerate(param_names_list):
+                solution_data[param_name] = float(ind[j])
+
+            # Add objective values
+            for j, obj_name in enumerate(objective_names_list):
+                solution_data[obj_name] = float(ind.fitness.values[j])
+
+            # Add weighted sum and solution ID
+            solution_data['Weighted Sum'] = float(weighted_sums[i])
+            solution_data['Solution ID'] = i
+
+            data.append(solution_data)
+
+        df = pd.DataFrame(data)
+
+        # Create parallel coordinates plot with Plotly
+        dimensions = []
+
+        # Add parameter dimensions with non-overlapping tick labels
+        for param in param_names_list:
+            param_min = df[param].min()
+            param_max = df[param].max()
+            dimensions.append(create_dimension(param, df[param], param_min, param_max))
+
+        # Add objective dimensions with non-overlapping tick labels
+        for obj in objective_names_list:
+            obj_min = df[obj].min()
+            obj_max = df[obj].max()
+            dimensions.append(create_dimension(obj, df[obj], obj_min, obj_max))
+
+        # Add weighted sum dimension at the far right
+        ws_min = df['Weighted Sum'].min()
+        ws_max = df['Weighted Sum'].max()
+        dimensions.append(create_dimension('Weighted Sum', df['Weighted Sum'], ws_min, ws_max))
+
+        # Create the parallel coordinates plot
+        with st.expander("Optimization Result (Pareto Front)", expanded=False):
+            st.write("## Solutions in Pareto Front")
+            st.write("Here you find the non-dominated solutions in Pareto Front")
+            fig = go.Figure(data=
+            go.Parcoords(
+                line=dict(
+                    color=df['Weighted Sum'],
+                    colorscale='Tealrose',
+                    showscale=True,
+                    colorbar=dict(title='Weighted Sum', nticks=11)
+                ),
+                dimensions=dimensions,
+                unselected=dict(line=dict(opacity=0)),
+                rangefont=dict(family="Arial", size=14),
+                tickfont=dict(family="Arial", size=11, weight="bold", color="black"),
+
+            )
+            )
+
+            fig.update_layout(
+                title="Solutions in Pareto Front",
+                height=600,
+                margin=dict(l=50, r=50, t=100, b=50),  # Increased left and right margins for axis labels
+                font=dict(family='Arial', size=14)  # Reduced font size to prevent overlapping
+            )
+
+            # Display the interactive plot
+            st.plotly_chart(fig, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"Error visualizing Pareto front: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+
+
+# Visualize a single selected solution
+def visualize_selected_solution(solution, param_names, objective_names, weights, hof):
+    try:
+        st.write("## Interactive Solution Explorer")
+        st.write("Here you can isolate and investigate a specific non-dominated solutions from Pareto Front")
+        st.subheader("Selected Solution Details")
+
+        # Ensure param_names and objective_names are lists
+        param_names = list(param_names)
+        objective_names = list(objective_names)
+
+        # Create tables for parameter and objective values (formatted to exactly 2 decimal places)
+        col1, col2 = st.columns(2)
+
+        with col1:
+            st.write("Parameter Values")
+            param_df = pd.DataFrame({
+                'Parameter': param_names,
+                'Value': [f"{float(p):.2f}" for p in solution]  # Format to exactly 2 decimal places
+            })
+            st.table(param_df)
+
+        with col2:
+            st.write("Objective Values")
+            obj_df = pd.DataFrame({
+                'Objective': objective_names,
+                'Value': [f"{float(f):.2f}" for f in solution.fitness.values],  # Format to exactly 2 decimal places
+                '(±)': [f"{float(u):.2f}" for u in solution.uncertainty],
+                # Format to exactly 2 decimal places
+                'Weight': [f"{float(w):.2f}" for w in weights]  # Format to exactly 2 decimal places
+            })
+            st.table(obj_df)
+
+        # Create the parallel coordinates plot for the selected solution using Plotly for consistency
+        # Combine parameter values and objective values for visualization
+        all_names = param_names + objective_names
+
+        # Extract all data for all solutions (parameters + objectives)
+        all_data = []
+        for ind in hof:
+            solution_data = {}
+            # Add parameter values
+            for j, param_name in enumerate(param_names):
+                solution_data[param_name] = float(ind[j])
+
+            # Add objective values
+            for j, obj_name in enumerate(objective_names):
+                solution_data[obj_name] = float(ind.fitness.values[j])
+
+            # Add solution ID
+            solution_data['is_selected'] = 0  # Not selected
+
+            all_data.append(solution_data)
+
+        # Add selected solution data
+        selected_data = {}
+        # Add parameter values
+        for j, param_name in enumerate(param_names):
+            selected_data[param_name] = float(solution[j])
+
+        # Add objective values
+        for j, obj_name in enumerate(objective_names):
+            selected_data[obj_name] = float(solution.fitness.values[j])
+
+        # Mark as selected
+        selected_data['is_selected'] = 1  # Selected
+
+        # Create DataFrame with all solutions
+        df_all = pd.DataFrame(all_data)
+        df_selected = pd.DataFrame([selected_data])
+
+        # Combine all data
+        df_combined = pd.concat([df_all, df_selected])
+
+        # Create dimensions for parallel coordinates with non-overlapping tick labels
+        dimensions = []
+        for name in all_names:
+            name_min = df_combined[name].min()
+            name_max = df_combined[name].max()
+            dimensions.append(create_dimension(name, df_combined[name], name_min, name_max))
+
+        # Create figure
+        fig = go.Figure(data=
+        go.Parcoords(
+            line=dict(
+                color=df_combined['is_selected'],
+                colorscale=[[0, 'rgba(250,250,250,0.5)'], [1, 'rgba(255,0,0,1)']],
+                showscale=False
+            ),
+            dimensions=dimensions,
+            unselected=dict(line=dict(opacity=0)),
+            rangefont=dict(family="Arial", size=14),
+            tickfont=dict(family="Arial", size=12, weight="bold", color="black")
+        )
+        )
+
+        fig.update_layout(
+            title="Selected Solution",
+            height=600,
+            margin=dict(l=50, r=50, t=100, b=50),  # Increased margins for labels
+            font=dict(family="Arial", size=14)  # Smaller font to prevent overlap
+        )
+
+        st.plotly_chart(fig, use_container_width=True)
+
+    except Exception as e:
+        st.error(f"Error visualizing selected solution: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+
+
+# Visualize parameter trends
+def visualize_parameter_trends(hof, param_names, objective_names):
+    with st.expander("Trend Analysis", expanded=False):
+        try:
+            st.write("## Trend Analysis")
+            st.write("Here you can investigate how each parameter affects objectives")
+            # Ensure param_names and objective_names are lists
+            param_names = list(param_names)
+            objective_names = list(objective_names)
+
+            # Extract data for all solutions
+            param_data = np.zeros((len(hof), len(param_names)))
+            objective_data = np.zeros((len(hof), len(objective_names)))
+
+            for i, ind in enumerate(hof):
+                # Add parameter values
+                for j, param in enumerate(ind):
+                    param_data[i, j] = float(param)
+
+                # Add objective values
+                for j, obj in enumerate(ind.fitness.values):
+                    objective_data[i, j] = float(obj)
+
+            # Create a trend diagram for each parameter
+            for p_idx, param_name in enumerate(param_names):
+                st.subheader(f"Parameter: {param_name}")
+
+                # Create a figure with subplots for each objective (without frame)
+                fig, axes = plt.subplots(1, len(objective_names), figsize=(15, 4), frameon=False)
+                if len(objective_names) == 1:
+                    axes = [axes]
+
+                for o_idx, (obj_name, ax) in enumerate(zip(objective_names, axes)):
+                    # Extract parameter and objective values
+                    x = param_data[:, p_idx]
+                    y = objective_data[:, o_idx]
+
+                    # Plot scatter points
+                    ax.scatter(x, y, alpha=0.5, color='green')
+
+                    # Add trendline if there are enough points
+                    if len(x) > 1:
+                        try:
+                            # Fit a polynomial of degree 1 (linear) or 2 (quadratic) based on data size
+                            degree = 2 if len(x) > 5 else 1
+                            z = np.polyfit(x, y, degree)
+                            p = np.poly1d(z)
+
+                            # Generate x values for the trendline
+                            x_trend = np.linspace(min(x), max(x), 100)
+
+                            # Plot the trendline
+                            ax.plot(x_trend, p(x_trend), "r--")
+                        except:
+                            # If fitting fails, skip trendline
+                            pass
+
+                    ax.set_xlabel(param_name)
+                    ax.set_ylabel(obj_name)
+                    ax.set_title(f"{param_name} vs {obj_name}")
+                    ax.grid(True, linestyle='--', alpha=0.7)
+
+                plt.tight_layout()
+                st.pyplot(fig)
+
+        except Exception as e:
+            st.error(f"Error visualizing parameter trends: {e}")
+            import traceback
+            st.code(traceback.format_exc())
+
+
+# Initialize session state variables
+def initialize_session_state():
+    if 'models' not in st.session_state:
+        st.session_state['models'] = []
+
+    if 'optimization_complete' not in st.session_state:
+        st.session_state['optimization_complete'] = False
+
+    if 'hof' not in st.session_state:
+        st.session_state['hof'] = None
+
+    if 'param_names' not in st.session_state:
+        st.session_state['param_names'] = []
+
+    if 'objective_names' not in st.session_state:
+        st.session_state['objective_names'] = []
+
+    if 'weights' not in st.session_state:
+        st.session_state['weights'] = []
+
+    if 'selected_solution_index' not in st.session_state:
+        st.session_state['selected_solution_index'] = 0
+
+    if 'active_tab' not in st.session_state:
+        st.session_state['active_tab'] = "Training"
+
+    if 'num_cores' not in st.session_state:
+        st.session_state['num_cores'] = 8
+
+    if 'output_path' not in st.session_state:
+        st.session_state['output_path'] = "evaluated_solutions.xlsx"
+
+
+# Callback for solution selection
+def on_solution_select():
+    # This function will be called when a solution is selected
+    # Get the key that triggered the callback
+    for key in st.session_state:
+        if key.startswith('solution_selector_') and st.session_state[key] != st.session_state.get(
+                'selected_solution_index', 0):
+            st.session_state['selected_solution_index'] = st.session_state[key]
+            break
+
+
+# Function to display optimization results in a separate mode
+def display_optimization_results():
+    st.title("Optimization Results Explorer")
+    st.write("Explore optimization results")
+
+    # Get data from session state
+    hof = st.session_state['hof']
+    param_names_list = st.session_state['param_names']
+    objective_names_list = st.session_state['objective_names']
+    weights = st.session_state['weights']
+    if not hof:
+        st.error("No optimization results found.")
+        return
+
+    # Display Pareto front visualization
+    visualize_pareto_front(hof, objective_names_list, param_names_list, weights)
+
+    # Display Parameter Trend Analysis (only once)
+    visualize_parameter_trends(hof, param_names_list, objective_names_list)
+
+    # Recalculate normalized weighted sum for consistent display
+    objective_values = np.array([list(ind.fitness.values) for ind in hof])
+    normalized_weighted_sums = normalize_weighted_sum(objective_values, weights)
+
+    # Update the weighted sum in each individual
+    for ind, norm_wsum in zip(hof, normalized_weighted_sums):
+        ind.weighted_sum = norm_wsum
+
+    # Sort solutions by normalized weighted sum (lowest to highest)
+    sorted_solutions = sorted(range(len(hof)), key=lambda i: hof[i].weighted_sum, reverse=False)
+
+    # Create a mappin
+# --- Model selection (Auto/Manual) helpers (PAMO 1.1.14) ---
+
+DEFAULT_RIDGE_ALPHAS = (0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0)
+DEFAULT_RF_TREES_FINAL = 150
+DEFAULT_RF_TREES_CV = 120
+DEFAULT_RF_MIN_SAMPLES_LEAF = 2
+
+SIMPLE_MODEL_TIE_TOL = 0.02      # 2%: if Ridge is within 2% of best NMAE, prefer Ridge
+HYBRID_MIN_GAIN_TOL = 0.01       # 1%: require Hybrid to beat best single model by >1% to justify complexity
+
+
+def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray):
+    """Return MAE, NMAE (MAE normalized by range), and R²."""
+    y_true = np.asarray(y_true, dtype=float).reshape(-1)
+    y_pred = np.asarray(y_pred, dtype=float).reshape(-1)
+
+    mae = float(mean_absolute_error(y_true, y_pred))
+    rng = float(np.ptp(y_true))
+    nmae = float(mae / (rng + 1e-9))
+
+    # R² is undefined if y is constant
+    r2 = float(r2_score(y_true, y_pred)) if np.std(y_true) > 1e-12 else float('nan')
+    return mae, nmae, r2
+
+
+def _cv_eval_ridge(X: pd.DataFrame, y: np.ndarray, cv: KFold, ridge_mode: str, ridge_alpha: float,
+                   ridge_alphas=DEFAULT_RIDGE_ALPHAS):
+    y_pred = np.zeros(len(X), dtype=float)
+    fold_scores = []
+    fold_alphas = []
+
+    for tr, va in cv.split(X):
+        X_tr, X_va = X.iloc[tr], X.iloc[va]
+        y_tr, y_va = y[tr], y[va]
+
+        if ridge_mode == "auto":
+            model = build_poly2_ridgecv(ridge_alphas)
+        else:
+            model = build_poly2_ridge(ridge_alpha)
+
+        model.fit(X_tr, y_tr)
+        pred = model.predict(X_va)
+        y_pred[va] = pred
+
+        try:
+            fold_scores.append(float(r2_score(y_va, pred)) if np.std(y_va) > 1e-12 else float('nan'))
+        except Exception:
+            fold_scores.append(float('nan'))
+
+        # Alpha used (if RidgeCV)
+        try:
+            ridge_step = model.named_steps.get("ridge", None)
+            if hasattr(ridge_step, "alpha_"):
+                fold_alphas.append(float(ridge_step.alpha_))
+        except Exception:
+            pass
+
+    mae, nmae, r2 = _compute_metrics(y, y_pred)
+    sigma_floor = float(np.std(y - y_pred)) if len(y) > 1 else 0.0
+
+    return {
+        "name": "Ridge",
+        "y_pred_cv": y_pred,
+        "fold_scores": fold_scores,
+        "mae": mae,
+        "nmae": nmae,
+        "r2": r2,
+        "sigma_floor": sigma_floor,
+        "fold_alphas": fold_alphas
+    }
+
+
+
+def _cv_eval_rf(X: pd.DataFrame, y: np.ndarray, cv: KFold, n_estimators: int, n_jobs: int,
+                min_samples_leaf: int = DEFAULT_RF_MIN_SAMPLES_LEAF, max_depth=None, max_features="sqrt"):
+    """Cross-validated out-of-fold predictions for Random Forest."""
+    y_pred = np.zeros(len(X), dtype=float)
+    fold_scores = []
+
+    for tr, va in cv.split(X):
+        X_tr, X_va = X.iloc[tr], X.iloc[va]
+        y_tr, y_va = y[tr], y[va]
+
+        model = RandomForestRegressor(
+            n_estimators=int(n_estimators),
+            random_state=42,
+            n_jobs=int(n_jobs) if n_jobs is not None else None,
+            max_features=max_features,
+            max_depth=max_depth,
+            min_samples_leaf=int(min_samples_leaf),
+        )
+        model.fit(X_tr, y_tr)
+        pred = model.predict(X_va)
+        y_pred[va] = pred
+
+        try:
+            fold_scores.append(float(r2_score(y_va, pred)) if np.std(y_va) > 1e-12 else float('nan'))
+        except Exception:
+            fold_scores.append(float('nan'))
+
+    mae, nmae, r2 = _compute_metrics(y, y_pred)
+    sigma_floor = float(np.std(y - y_pred)) if len(y) > 1 else 0.0
+
+    return {
+        "name": "Random Forest",
+        "y_pred_cv": y_pred,
+        "fold_scores": fold_scores,
+        "mae": mae,
+        "nmae": nmae,
+        "r2": r2,
+        "sigma_floor": sigma_floor
+    }
+
+
+def _cv_eval_hybrid(X: pd.DataFrame, y: np.ndarray, cv: KFold, ridge_mode: str, ridge_alpha: float,
+                    n_estimators: int, n_jobs: int, ridge_alphas=DEFAULT_RIDGE_ALPHAS,
+                    min_samples_leaf: int = DEFAULT_RF_MIN_SAMPLES_LEAF, max_depth=None, max_features="sqrt"):
+    y_pred = np.zeros(len(X), dtype=float)
+    fold_scores = []
+    fold_alphas = []
+
+    for tr, va in cv.split(X):
+        X_tr, X_va = X.iloc[tr], X.iloc[va]
+        y_tr, y_va = y[tr], y[va]
+
+        # Ridge baseline
+        if ridge_mode == "auto":
+            ridge_model = build_poly2_ridgecv(ridge_alphas)
+        else:
+            ridge_model = build_poly2_ridge(ridge_alpha)
+
+        ridge_model.fit(X_tr, y_tr)
+
+        # Residual RF corrector
+        resid_tr = y_tr - ridge_model.predict(X_tr)
+
+        rf_model = RandomForestRegressor(
+            n_estimators=int(n_estimators),
+            random_state=42,
+            n_jobs=int(n_jobs) if n_jobs is not None else None,
+            max_features=max_features,
+            max_depth=max_depth,
+            min_samples_leaf=int(min_samples_leaf)
+        )
+        rf_model.fit(X_tr, resid_tr)
+
+        pred = ridge_model.predict(X_va) + rf_model.predict(X_va)
+        y_pred[va] = pred
+
+        try:
+            fold_scores.append(float(r2_score(y_va, pred)) if np.std(y_va) > 1e-12 else float('nan'))
+        except Exception:
+            fold_scores.append(float('nan'))
+
+        # Alpha used (if RidgeCV)
+        try:
+            ridge_step = ridge_model.named_steps.get("ridge", None)
+            if hasattr(ridge_step, "alpha_"):
+                fold_alphas.append(float(ridge_step.alpha_))
+        except Exception:
+            pass
+
+    mae, nmae, r2 = _compute_metrics(y, y_pred)
+    sigma_floor = float(np.std(y - y_pred)) if len(y) > 1 else 0.0
+
+    return {
+        "name": "Hybrid (Ridge + RF residual)",
+        "y_pred_cv": y_pred,
+        "fold_scores": fold_scores,
+        "mae": mae,
+        "nmae": nmae,
+        "r2": r2,
+        "sigma_floor": sigma_floor,
+        "fold_alphas": fold_alphas
+    }
+
+
+def _choose_model_kind(ridge_info, rf_info, hybrid_info):
+    """
+    Choose the model kind using NMAE with a simplicity bias:
+      - If Ridge is within SIMPLE_MODEL_TIE_TOL of the best NMAE -> choose Ridge.
+      - Choose Hybrid only if it improves over the best single model by > HYBRID_MIN_GAIN_TOL.
+    """
+    infos = {
+        "Ridge": ridge_info,
+        "Random Forest": rf_info,
+        "Hybrid": hybrid_info
+    }
+
+    best_kind = min(infos.keys(), key=lambda k: infos[k]["nmae"])
+    best_nmae = infos[best_kind]["nmae"]
+
+    # Prefer Ridge if close to best
+    if ridge_info["nmae"] <= best_nmae * (1.0 + SIMPLE_MODEL_TIE_TOL):
+        return "Ridge"
+
+    # If best is Hybrid, require meaningful gain over best single model
+    if best_kind == "Hybrid":
+        best_single = "Ridge" if ridge_info["nmae"] <= rf_info["nmae"] else "Random Forest"
+        if infos[best_single]["nmae"] <= best_nmae * (1.0 + HYBRID_MIN_GAIN_TOL):
+            # If Ridge is close to that best single model, still prefer Ridge
+            if ridge_info["nmae"] <= infos[best_single]["nmae"] * (1.0 + SIMPLE_MODEL_TIE_TOL):
+                return "Ridge"
+            return best_single
+        return "Hybrid"
+
+    return best_kind
+
+
+# Light-weight RF hyperparameter tuning (kept small for interactive use)
+DEFAULT_RF_GRID = [
+    {"min_samples_leaf": 1, "max_depth": None, "max_features": "sqrt"},
+    {"min_samples_leaf": 2, "max_depth": None, "max_features": "sqrt"},
+    {"min_samples_leaf": 4, "max_depth": None, "max_features": "sqrt"},
+    {"min_samples_leaf": 1, "max_depth": 12, "max_features": "sqrt"},
+    {"min_samples_leaf": 2, "max_depth": 12, "max_features": "sqrt"},
+    {"min_samples_leaf": 4, "max_depth": 12, "max_features": "sqrt"},
+]
+
+def _cv_select_best_rf(X: pd.DataFrame, y: np.ndarray, cv: KFold, n_estimators: int, n_jobs: int,
+                       grid=DEFAULT_RF_GRID):
+    """Evaluate a small RF grid and return the best config by CV NMAE."""
+    best = None
+    for params in grid:
+        info = _cv_eval_rf(
+            X, y, cv,
+            n_estimators=n_estimators,
+            n_jobs=n_jobs,
+            min_samples_leaf=int(params["min_samples_leaf"]),
+            max_depth=params["max_depth"],
+            max_features=params["max_features"],
+        )
+        info["params"] = params
+        if best is None or info["nmae"] < best["nmae"]:
+            best = info
+    return best
+
+def _cv_select_best_hybrid(X: pd.DataFrame, y: np.ndarray, cv: KFold, ridge_mode: str, ridge_alpha: float,
+                           n_estimators: int, n_jobs: int, grid=DEFAULT_RF_GRID):
+    """Evaluate a small Hybrid grid (RF residual parameters) and return the best config by CV NMAE."""
+    best = None
+    for params in grid:
+        info = _cv_eval_hybrid(
+            X, y, cv,
+            ridge_mode=ridge_mode,
+            ridge_alpha=ridge_alpha,
+            n_estimators=n_estimators,
+            n_jobs=n_jobs,
+            min_samples_leaf=int(params["min_samples_leaf"]),
+            max_depth=params["max_depth"],
+            max_features=params["max_features"],
+        )
+        info["params"] = params
+        if best is None or info["nmae"] < best["nmae"]:
+            best = info
+    return best
+
+# Function to preprocess data and train model with cross-validation
+@st.cache_resource(show_spinner=False, hash_funcs={pd.DataFrame: compute_df_signature})
+def preprocess_and_train_with_cv(df, num_objectives, ridge_alpha=0.1, cv_folds=5,
+                                 model_selection_mode="Auto", objective_model_overrides=None, store_in_session: bool = True, rf_n_estimators: int = 150, num_cores: int = 8, data_signature: str = ""):
+    """
+    Train one surrogate per objective, with per-objective model selection.
+
+    Candidate models (per objective):
+      - Ridge: Poly(deg=2)+Scaler+RidgeCV (auto) or Ridge(alpha) (manual)
+      - Random Forest
+      - Hybrid: Ridge baseline + RF residual corrector
+
+    Selection criterion:
+      - Primary: CV NMAE (MAE normalized by target range)
+      - Reported: CV R² + MAE + NMAE
+      - Bias: prefer Ridge if within SIMPLE_MODEL_TIE_TOL of best;
+              choose Hybrid only if it beats best single model by > HYBRID_MIN_GAIN_TOL
+
+    Manual override:
+      objective_model_overrides can specify "Ridge", "Random Forest", "Hybrid", or "Auto" per objective name.
+    """
+    try:
+        if objective_model_overrides is None:
+            objective_model_overrides = {}
+
+        X = df.drop(df.columns[-num_objectives:], axis=1)
+        y_list = [df[col] for col in df.columns[-num_objectives:]]
+        objective_names = list(df.columns[-num_objectives:])
+
+        # CV setup
+        n_splits = int(min(max(2, cv_folds), len(X)))
+        cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+
+        # Resources
+        n_jobs = int(num_cores if num_cores is not None else (os.cpu_count() or 1))
+        n_jobs = max(1, min(n_jobs, os.cpu_count() or n_jobs))
+
+        rf_trees_final = int(rf_n_estimators)
+        rf_trees_cv = int(min(DEFAULT_RF_TREES_CV, rf_trees_final))
+
+        models = []
+        plot_estimators = []  # sklearn estimators for learning curves
+        cv_scores = []
+        feature_importances = []
+        objective_uncertainties = []
+        chosen_model_kinds = []
+        per_objective_reports = []
+
+        for i, (obj_name, y_series) in enumerate(zip(objective_names, y_list)):
+            y = np.asarray(y_series, dtype=float).reshape(-1)
+
+            # Determine whether Ridge alpha is auto-tuned for this objective
+            # Auto mode -> ridge_mode="auto"; Manual model selection -> ridge_mode="manual"
+            ridge_mode = "auto" if str(model_selection_mode).lower().startswith("auto") else "manual"
+
+            # Override per objective
+            override = str(objective_model_overrides.get(obj_name, "Auto"))
+            override_norm = override.strip().lower()
+
+            # Evaluate candidates (needed for Auto or for "Auto" override inside Manual mode)
+            ridge_info = _cv_eval_ridge(X, y, cv, ridge_mode=ridge_mode, ridge_alpha=float(ridge_alpha))
+            rf_info = _cv_select_best_rf(X, y, cv, n_estimators=rf_trees_cv, n_jobs=n_jobs)
+            hybrid_info = _cv_select_best_hybrid(X, y, cv, ridge_mode=ridge_mode, ridge_alpha=float(ridge_alpha), n_estimators=rf_trees_cv, n_jobs=n_jobs)
+
+            # Decide model kind
+            if override_norm in ("ridge", "random forest", "random_forest", "rf", "hybrid"):
+                if override_norm == "ridge":
+                    chosen = "Ridge"
+                elif override_norm in ("random forest", "random_forest", "rf"):
+                    chosen = "Random Forest"
+                else:
+                    chosen = "Hybrid"
+                selection_reason = f"Manual override: {override}"
+            else:
+                chosen = _choose_model_kind(ridge_info, rf_info, hybrid_info)
+                selection_reason = "Auto selection (CV NMAE + simplicity bias)"
+
+            chosen_model_kinds.append(chosen)
+
+            # Select corresponding CV report
+            chosen_info = {"Ridge": ridge_info, "Random Forest": rf_info, "Hybrid": hybrid_info}[chosen]
+            sigma_floor = float(chosen_info["sigma_floor"])
+            objective_uncertainties.append(sigma_floor)
+            cv_scores.append(chosen_info["fold_scores"])
+
+            # Train final model(s) on all data
+            if chosen == "Ridge":
+                if ridge_mode == "auto" and override_norm not in ("ridge",):
+                    final_ridge = build_poly2_ridgecv(DEFAULT_RIDGE_ALPHAS)
+                else:
+                    final_ridge = build_poly2_ridge(float(ridge_alpha))
+                final_ridge.fit(X, y)
+
+                chosen_alpha = None
+                try:
+                    ridge_step = final_ridge.named_steps.get("ridge", None)
+                    if hasattr(ridge_step, "alpha_"):
+                        chosen_alpha = float(ridge_step.alpha_)
+                except Exception:
+                    pass
+
+                surrogate = RidgeSurrogate(final_ridge, sigma_floor=sigma_floor, chosen_alpha=chosen_alpha)
+                models.append(surrogate)
+                plot_estimators.append(final_ridge)
+
+                # Sensitivity from polynomial ridge coefficients
+                sens = compute_param_sensitivity_from_poly_ridge(final_ridge, X.columns)
+                feature_importances.append(sens)
+
+            elif chosen == "Random Forest":
+                rf_params = (rf_info.get('params') or {})
+                final_rf = RandomForestRegressor(
+                    n_estimators=int(rf_trees_final),
+                    random_state=42,
+                    n_jobs=int(n_jobs) if n_jobs is not None else None,
+                    max_features=rf_params.get('max_features', 'sqrt'),
+                    max_depth=rf_params.get('max_depth', None),
+                    min_samples_leaf=int(rf_params.get('min_samples_leaf', DEFAULT_RF_MIN_SAMPLES_LEAF)),
+                )
+                final_rf.fit(X, y)
+
+                surrogate = RandomForestSurrogate(final_rf, sigma_floor=sigma_floor)
+                models.append(surrogate)
+                plot_estimators.append(final_rf)
+
+                # Parameter sensitivity from RF feature_importances_ (already parameter-level)
+                try:
+                    feature_importances.append(np.asarray(final_rf.feature_importances_, dtype=float))
+                except Exception:
+                    feature_importances.append(np.zeros(len(X.columns), dtype=float))
+
+            else:  # Hybrid
+                if ridge_mode == "auto" and override_norm not in ("hybrid",):
+                    final_ridge = build_poly2_ridgecv(DEFAULT_RIDGE_ALPHAS)
+                    ridge_auto = True
+                else:
+                    final_ridge = build_poly2_ridge(float(ridge_alpha))
+                    ridge_auto = False
+
+                final_ridge.fit(X, y)
+                resid_all = y - final_ridge.predict(X)
+
+                hyb_params = (hybrid_info.get('params') or {})
+                final_rf = RandomForestRegressor(
+                    n_estimators=int(rf_trees_final),
+                    random_state=42,
+                    n_jobs=int(n_jobs) if n_jobs is not None else None,
+                    max_features=hyb_params.get('max_features', 'sqrt'),
+                    max_depth=hyb_params.get('max_depth', None),
+                    min_samples_leaf=int(hyb_params.get('min_samples_leaf', DEFAULT_RF_MIN_SAMPLES_LEAF)),
+                )
+                final_rf.fit(X, resid_all)
+
+                surrogate = HybridSurrogate(final_ridge, final_rf, sigma_floor=sigma_floor)
+                surrogate.kind = "Hybrid"
+                models.append(surrogate)
+
+                # Provide a sklearn estimator for learning curves
+                plot_estimators.append(HybridEstimator(
+                    ridge_alpha=float(ridge_alpha),
+                    ridge_alphas=DEFAULT_RIDGE_ALPHAS,
+                    ridge_auto=ridge_auto,
+                    rf_n_estimators=int(rf_trees_final),
+                    rf_min_samples_leaf=int(hyb_params.get('min_samples_leaf', DEFAULT_RF_MIN_SAMPLES_LEAF)),
+                    rf_max_depth=hyb_params.get('max_depth', None),
+                    rf_max_features=hyb_params.get('max_features', 'sqrt'),
+                    n_jobs=int(n_jobs) if n_jobs is not None else None
+                ))
+
+                sens = compute_param_sensitivity_from_poly_ridge(final_ridge, X.columns)
+                feature_importances.append(sens)
+
+            # Build report for UI
+            per_objective_reports.append({
+                "Objective": obj_name,
+                "Selected model": chosen,
+                "Selection basis": selection_reason,
+                "Ridge CV NMAE": ridge_info["nmae"],
+                "RF CV NMAE": rf_info["nmae"],
+                "Hybrid CV NMAE": hybrid_info["nmae"],
+                "Ridge CV R2": ridge_info["r2"],
+                "RF CV R2": rf_info["r2"],
+                "Hybrid CV R2": hybrid_info["r2"],
+                "Selected CV MAE": chosen_info["mae"],
+                "Selected CV NMAE": chosen_info["nmae"],
+                "Selected CV R2": chosen_info["r2"],
+                "Uncertainty floor (CV resid std)": sigma_floor,
+            })
+
+            # Print short summary (keeps existing behavior of showing training diagnostics)
+            st.write(f"Objective {i + 1} ({obj_name}) -> Selected: **{chosen}**")
+            st.write(f"CV NMAE: Ridge={ridge_info['nmae']:.3f} | RF={rf_info['nmae']:.3f} | Hybrid={hybrid_info['nmae']:.3f}")
+            if np.isfinite(chosen_info['r2']):
+                st.write(f"Selected CV R²: {chosen_info['r2']:.2f} (folds: {[f'{s:.2f}' if np.isfinite(s) else 'nan' for s in chosen_info['fold_scores']]})")
+            st.write(f"Estimated uncertainty floor (CV residual std): {sigma_floor:.2f}")
+            st.markdown("---")
+
+        # CV boxplot (selected model per objective)
+        if cv_scores:
+            fig, ax = plt.subplots(figsize=(10, 6), frameon=False)
+            ax.boxplot(cv_scores)
+            ax.set_xticklabels(objective_names, rotation=45, ha='right')
+            ax.set_ylabel("R² Score")
+            ax.set_title("Cross-Validation Performance by Objective (Selected Model)")
+            ax.grid(True, linestyle='--', alpha=0.7)
+            plt.tight_layout()
+            st.pyplot(fig)
+
+        # Feature sensitivity plot (parameter-level)
+        if feature_importances:
+            fig, axes = plt.subplots(1, len(y_list), figsize=(15, 5), sharey=False, frameon=False)
+            if len(y_list) == 1:
+                axes = [axes]
+
+            for i, (ax, importances) in enumerate(zip(axes, feature_importances)):
+                importances = np.asarray(importances, dtype=float).reshape(-1)
+                if len(importances) != len(X.columns):
+                    importances = np.resize(importances, len(X.columns))
+                indices = np.argsort(importances)
+                sorted_importances = importances[indices]
+                sorted_names = [X.columns[j] for j in indices]
+
+                max_imp = float(np.max(sorted_importances)) if len(sorted_importances) else 0.0
+                colors = cm.RdYlGn_r(sorted_importances / max_imp if max_imp > 0 else 0)
+
+                y_pos = np.arange(len(indices))
+                ax.barh(y_pos, sorted_importances, color=colors)
+                ax.set_yticks(y_pos)
+                ax.set_yticklabels(sorted_names)
+                ax.set_title(f"Sensitivity - {objective_names[i]} ({chosen_model_kinds[i]})")
+                ax.grid(True, linestyle='--', alpha=0.7)
+
+            plt.tight_layout()
+            st.pyplot(fig)
+
+        # Store outputs
+        if store_in_session:
+            st.session_state['models'] = models
+            st.session_state['objective_uncertainties'] = objective_uncertainties
+            st.session_state['model_kinds'] = chosen_model_kinds
+            st.session_state['objective_model_kinds'] = chosen_model_kinds
+            st.session_state['objective_model_reports'] = per_objective_reports
+            st.session_state['plot_estimators'] = plot_estimators
+            st.session_state['models_signature'] = f"{data_signature}|alpha={ridge_alpha}|folds={cv_folds}|trees={rf_n_estimators}|cores={num_cores}|kinds={tuple(chosen_model_kinds)}"
+
+        # Quick prediction smoke test
+        if len(X) > 0:
+            sample = X.iloc[0].values
+            st.write("### Testing Model Predictions")
+            st.write(f"Sample input: {sample}")
+            for i, model in enumerate(models):
+                pred = float(np.asarray(model.predict([sample]))[0])
+                st.write(f"Objective {i + 1} ({objective_names[i]}) prediction: {pred:.2f}")
+
+        return models, X.columns, objective_names
+
+    except Exception as e:
+        st.error(f"Error in model training: {e}")
+        import traceback
+        st.code(traceback.format_exc())
+
+
+def evaluate_batch(batch_params, models, num_objectives, objective_uncertainties=None):
+    results = []
+
+    for params in batch_params:
+        params_array = np.array([params])
+
+        predictions = []
+        uncertainties = []
+
+        for obj_idx, model in enumerate(models):
+            # Prediction
+            try:
+                pred_val = float(model.predict(params_array)[0])
+            except Exception:
+                pred_val = 0.0
+
+            # Uncertainty: hybrid if available; fallback to constant list
+            if hasattr(model, "predict_uncertainty"):
+                try:
+                    unc_val = float(np.asarray(model.predict_uncertainty(params_array))[0])
+                except Exception:
+                    unc_val = 0.0
+            elif objective_uncertainties is not None and obj_idx < len(objective_uncertainties):
+                unc_val = float(objective_uncertainties[obj_idx])
+            else:
+                unc_val = 0.0
+
+            predictions.append(pred_val)
+            uncertainties.append(unc_val)
+
+        # Ensure correct length
+        if len(predictions) != num_objectives:
+            if len(predictions) < num_objectives:
+                predictions = predictions + [0.0] * (num_objectives - len(predictions))
+            else:
+                predictions = predictions[:num_objectives]
+
+        if len(uncertainties) != num_objectives:
+            if len(uncertainties) < num_objectives:
+                uncertainties = uncertainties + [0.0] * (num_objectives - len(uncertainties))
+            else:
+                uncertainties = uncertainties[:num_objectives]
+
+        rounded_fitness = [f"{float(fit_val):.2f}" for fit_val in predictions]
+        rounded_uncertainty = [f"{float(unc_val):.2f}" for unc_val in uncertainties]
+
+        results.append({
+            'params': params,
+            'predictions': predictions,
+            'uncertainties': uncertainties,
+            'rounded_fitness': rounded_fitness,
+            'rounded_uncertainty': rounded_uncertainty
+        })
+
+    return results
+
+
+def process_completed_results(async_results, hof, temp_results_file,
+                              processed_count, total_combinations,
+                              progress_bar, status_text, start_time):
+    """Process any completed async results"""
+    # Check which results are ready
+    completed_indices = []
+    for i, (future, batch_size) in enumerate(async_results):
+        if future.done():
+            completed_indices.append(i)
+
+            try:
+                # Get the result
+                result_batch = future.result()
+            except Exception as e:
+                st.error(f"Error in batch processing: {e}")
+                continue
+
+            # Process results and update Pareto front
+            with open(temp_results_file, 'a') as f:
+                for result in result_batch:
+                    # Create individual
+                    individual = creator.Individual(result['params'])
+                    individual.fitness.values = tuple(result['predictions'])
+                    individual.weighted_sum = 0.0  # to be calculated after normalization
+                    individual.uncertainty = tuple(result['uncertainties'])
+
+                    # Update Pareto front
+                    hof.update([individual])
+
+                    # Write to CSV directly to save memory
+                    row_data = [str(float(p)) for p in result['params']] + result['rounded_fitness'] + result[
+                        'rounded_uncertainty']
+                    f.write(','.join(row_data) + '\n')
+
+            # Update progress
+            processed_count += batch_size
+            progress = min(1.0, processed_count / total_combinations)
+            progress_bar.progress(progress)
+
+            elapsed_time = time.time() - start_time
+            estimated_total = elapsed_time / progress if progress > 0 else 0
+            remaining_time = estimated_total - elapsed_time
+
+            status_text.text(f"Processed {processed_count}/{total_combinations} combinations. " +
+                             f"Elapsed: {elapsed_time:.2f}s. Estimated remaining: {remaining_time:.2f}s.")
+
+    # Remove completed results
+    for i in sorted(completed_indices, reverse=True):
+        async_results.pop(i)
+
+    return processed_count
+
+
+# Function to perform streaming optimization with optimized parallel processing
+@st.cache_resource
+def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights, output_path, objective_names, objective_uncertainties=None, models_signature: str = "", num_cores: int = 1):
+    try:
+        st.write("Starting optimization process with streaming parallel processing...")
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+
+        start_time = time.time()
+
+        hof = tools.ParetoFront()
+
+        # Get parameter combinations generator and total count
+        param_generator, total_combinations = parameter_combinations_generator(param_ranges)
+
+        st.write(f"Total parameter combinations to evaluate: {total_combinations}")
+
+        # Threads for parallel evaluation (caps to available CPU cores)
+        requested_cores = int(num_cores) if num_cores is not None else int(st.session_state.get('num_cores', 8))
+        available_cores = os.cpu_count() or requested_cores
+        num_cores = max(1, min(requested_cores, available_cores))
+        st.write(f"Using {num_cores} threads for processing (requested: {requested_cores}, available: {available_cores})")
+
+        # Calculate optimal batch size for Streamlit Cloud (smaller batches for stability)
+        if total_combinations < 1000:
+            batch_size = max(1, min(250, total_combinations // 10))
+        elif total_combinations < 10000:
+            batch_size = max(5, min(500, total_combinations // 20))
+        else:
+            batch_size = max(10, min(1000, total_combinations // 50))  # Much smaller batches for large datasets
 
         st.write(f"Using adaptive batch size: {batch_size}")
 
@@ -1070,6 +2369,8 @@ def display_optimization_results():
                 all_obj_min = []
                 all_obj_max = []
                 all_normalized_values = []
+                all_percentiles = []
+                all_percentiles = []
 
                 # Collect values from the loop and normalize each objective individually
                 for i, (obj, pred) in enumerate(zip(objective_names_list, preds)):
@@ -1086,7 +2387,13 @@ def display_optimization_results():
                     all_obj_names.append(str(obj))
                     all_obj_min.append(obj_min)
                     all_obj_max.append(obj_max)
+                    try:
+                        _vals = np.asarray(obj_values, dtype=float)
+                        percentile = float(np.mean(_vals <= float(pred)) * 100.0) if len(_vals) else 50.0
+                    except Exception:
+                        percentile = 50.0
                     all_normalized_values.append(normalized_pred)
+                    all_percentiles.append(percentile)
 
                 # CLOSE THE POLYGON: Add the first point at the end
                 all_normalized_values_closed = all_normalized_values + [all_normalized_values[0]]
@@ -1141,7 +2448,8 @@ def display_optimization_results():
                     "Estimated Value": [f"{p:.2f}" for p in all_pred_values],
                     "Min Range": [f"{m:.2f}" for m in all_obj_min],
                     "Max Range": [f"{m:.2f}" for m in all_obj_max],
-                    "Normalized (%)": [f"{n:.1f}%" for n in all_normalized_values]
+                    "Normalized (%)": [f"{n:.1f}%" for n in all_normalized_values],
+                    "Percentile": [f"{p:.1f}%" for p in all_percentiles],
                 })
                 st.table(df_estimates_detailed)
 
@@ -1400,6 +2708,26 @@ def explore_uploaded_results():
         st.write(
             "Here you can estimate what is expected to be the result for each individual objective for entered parameter values")
 
+        st.markdown("#### Model selection (Explorer)")
+        explorer_model_strategy = st.radio(
+            "Model strategy for Explorer estimation",
+            options=["Auto (recommended)", "Manual per objective"],
+            index=0,
+            key="explorer_model_strategy",
+            help="Auto: PAMO selects Ridge / Random Forest / Hybrid per objective using cross-validated NMAE on the uploaded dataset."
+        )
+
+        explorer_objective_overrides = {obj: "Auto" for obj in objective_names}
+        if str(explorer_model_strategy).lower().startswith("manual"):
+            st.caption("Manual overrides apply only to Explorer estimation.")
+            for obj in objective_names:
+                explorer_objective_overrides[obj] = st.selectbox(
+                    f"Model for {obj}",
+                    options=["Auto", "Ridge", "Random Forest", "Hybrid"],
+                    index=0,
+                    key=f"explorer_model_override_{obj}"
+                )
+
         st.write("### Enter parameter values to simulate:")
 
         input_values = {}
@@ -1410,30 +2738,67 @@ def explore_uploaded_results():
                 input_values[param] = st.number_input(f"{param}", key=f"explorer_custom_input_{i}")
 
         input_array = np.array([[input_values[p] for p in param_names]])
-
         if st.button("Estimate Objectives Results", key="explorer_estimate_btn"):
-            # Train models with uploaded data
             try:
-                # Prepare training data from uploaded file
-                X_train = df[param_names]
-                y_train = [df[obj] for obj in objective_names]
+                # Train (or reuse) Explorer models on the uploaded dataset (do not overwrite Training-tab models)
+                ridge_alpha = float(st.session_state.get("ridge_alpha", 0.1))
+                cv_folds = int(st.session_state.get("cv_folds", 5))
+                rf_trees = int(st.session_state.get("rf_n_estimators", 50))
+                num_cores = int(st.session_state.get("num_cores", 1))
 
-                st.write("Training models with uploaded data...")
-                models = []
+                # Use only parameter + objective columns for training
+                df_train = df[param_names + objective_names].copy()
 
-                # Train a model for each objective
-                for i, y_i in enumerate(y_train):
-                    alpha = float(st.session_state.get('ridge_alpha', 0.1))
-                    model = build_poly2_ridge(alpha=alpha)
-                    model.fit(X_train, y_i)
-                    models.append(model)
+                signature = (
+                    getattr(uploaded_file, "name", "uploaded"),
+                    tuple(df_train.shape),
+                    tuple(param_names),
+                    tuple(objective_names),
+                    str(explorer_model_strategy),
+                    tuple(explorer_objective_overrides.get(o, "Auto") for o in objective_names),
+                    float(ridge_alpha),
+                    int(cv_folds),
+                    int(rf_trees),
+                    int(num_cores),
+                )
 
+                if st.session_state.get("explorer_models_signature") != signature:
+                    st.info("Training surrogate models for Explorer estimation (per objective)...")
+                    models, _, _ = preprocess_and_train_with_cv(
+                        df_train,
+                        len(objective_names),
+                        ridge_alpha=ridge_alpha,
+                        cv_folds=cv_folds,
+                        model_selection_mode="Auto" if str(explorer_model_strategy).lower().startswith("auto") else "Manual",
+                        objective_model_overrides=explorer_objective_overrides,
+                        store_in_session=False
+                    ,
+                        rf_n_estimators=int(rf_trees),
+                        num_cores=int(num_cores),
+                        data_signature=compute_df_signature(df_train)
+                    )
+                    st.session_state["explorer_models"] = models
+                    st.session_state["explorer_models_signature"] = signature
+                else:
+                    models = st.session_state.get("explorer_models", [])
+
+                if not models:
+                    st.error("No models available for Explorer estimation.")
+                    st.stop()
+
+                # Show which model was selected per objective (transparency)
+                try:
+                    kinds = [getattr(m, "kind", type(m).__name__) for m in models]
+                    st.dataframe(pd.DataFrame({"Objective": objective_names, "Selected model": kinds}), use_container_width=True)
+                except Exception:
+                    pass
                 st.subheader("Estimated Objective Values")
                 preds = [model.predict(input_array)[0] for model in models]
                 df_estimates = pd.DataFrame({
                     "Objective": objective_names,
                     "Estimated Value": [f"{p:.2f}" for p in preds]
                 })
+                st.dataframe(df_estimates, use_container_width=True)
 
                 # RADAR CHART IMPLEMENTATION - REPLACES GAUGE CHARTS
                 # Collect all data for radar chart
@@ -1442,6 +2807,7 @@ def explore_uploaded_results():
                 all_obj_min = []
                 all_obj_max = []
                 all_normalized_values = []
+                all_percentiles = []
 
                 # Collect values from the loop and normalize each objective individually
                 for i, (obj, pred) in enumerate(zip(objective_names, preds)):
@@ -1454,11 +2820,18 @@ def explore_uploaded_results():
                     else:
                         normalized_pred = 50  # If min == max, put it in the middle
 
+                    try:
+                        _vals = np.asarray(obj_values, dtype=float)
+                        percentile = float(np.mean(_vals <= float(pred)) * 100.0) if len(_vals) else 50.0
+                    except Exception:
+                        percentile = 50.0
+
                     all_pred_values.append(float(pred))  # Keep original values for hover/display
                     all_obj_names.append(str(obj))
                     all_obj_min.append(obj_min)
                     all_obj_max.append(obj_max)
                     all_normalized_values.append(normalized_pred)
+                    all_percentiles.append(percentile)
 
                 # Close the polygon: Add the first point at the end
                 all_normalized_values_closed = all_normalized_values + [all_normalized_values[0]]
@@ -1512,7 +2885,8 @@ def explore_uploaded_results():
                     "Estimated Value": [f"{p:.2f}" for p in all_pred_values],
                     "Min Range": [f"{m:.2f}" for m in all_obj_min],
                     "Max Range": [f"{m:.2f}" for m in all_obj_max],
-                    "Normalized (%)": [f"{n:.1f}%" for n in all_normalized_values]
+                    "Normalized (%)": [f"{n:.1f}%" for n in all_normalized_values],
+                    "Percentile": [f"{p:.1f}%" for p in all_percentiles],
                 })
                 st.table(df_estimates_detailed)
 
@@ -1676,12 +3050,29 @@ def main():
         # Sidebar for configuration
         with st.sidebar.expander("Setup", expanded=False):
             st.header("Setup")
-            ridge_alpha = st.slider("Ridge alpha (regularization)", min_value=0.001, max_value=10.0, value=0.1, step=0.001,
-                                     format="%.3f", help="Higher alpha = more regularization (smoother model).")
+            ridge_alpha = st.slider("Ridge alpha (regularization)", min_value=0.001, max_value=10.0, value=0.3, step=0.01,
+                                     format="%.2f", help="Higher alpha = more regularization (smoother model).")
             st.session_state['ridge_alpha'] = float(ridge_alpha)
-            cv_folds = st.slider("Cross-Validation Folds", min_value=3, max_value=10, value=5,
+
+            rf_n_estimators = st.slider(
+                "Number of Trees in Random Forest",
+                min_value=1, max_value=200, value=int(st.session_state.get('rf_n_estimators', 50)), step=1,
+                help="Controls Random Forest complexity/smoothness. More trees improve stability but increase runtime."
+            )
+            st.session_state['rf_n_estimators'] = int(rf_n_estimators)
+
+            model_selection_mode = st.radio(
+                "Model strategy",
+                options=["Auto (recommended)", "Manual per objective"],
+                index=0,
+                help="Auto: PAMO selects Ridge / Random Forest / Hybrid independently per objective using cross-validated NMAE.\nManual: you can override the choice per objective in the Training tab."
+            )
+            st.session_state['model_selection_mode'] = model_selection_mode
+
+            cv_folds = st.slider("Cross-Validation Folds", min_value=3, max_value=20, value=5,
                                  help="Only change if you are sure what you are doing")
-            st.session_state['num_cores'] = st.slider("Number of CPU Cores", min_value=1, max_value=16, value=8,
+            st.session_state['cv_folds'] = int(cv_folds)
+            st.session_state['num_cores'] = st.slider("Number of CPU Cores", min_value=1, max_value=32, value=16,
                                                       help="Only change if you are sure what you are doing")
 
         # Create tabs for Training, Results and Explorer
@@ -1727,13 +3118,41 @@ def main():
                 y = [df[col] for col in df.columns[-num_objectives:]]
                 objective_names = df.columns[-num_objectives:].tolist()
 
-                models, param_names, objective_names = preprocess_and_train_with_cv(df, num_objectives, ridge_alpha,
-                                                                                    cv_folds)
+                # Manual overrides (optional)
+                model_selection_mode = st.session_state.get('model_selection_mode', 'Auto (recommended)')
+                objective_model_overrides = {}
+
+                if str(model_selection_mode).lower().startswith('manual'):
+                    st.subheader("Manual model selection per objective")
+                    st.caption("If set to Auto, PAMO will decide based on cross-validated NMAE.")
+                    for obj in objective_names:
+                        objective_model_overrides[obj] = st.selectbox(
+                            f"Model for {obj}",
+                            options=["Auto", "Ridge", "Random Forest", "Hybrid"],
+                            index=0,
+                            key=f"model_override_{obj}"
+                        )
+                else:
+                    objective_model_overrides = {obj: "Auto" for obj in objective_names}
+
+                st.session_state['objective_model_overrides'] = objective_model_overrides
+
+                models, param_names, objective_names = preprocess_and_train_with_cv(
+                    df,
+                    num_objectives,
+                    ridge_alpha=ridge_alpha,
+                    cv_folds=cv_folds,
+                    model_selection_mode="Auto" if str(model_selection_mode).lower().startswith("auto") else "Manual",
+                    objective_model_overrides=objective_model_overrides,
+                    rf_n_estimators=int(st.session_state.get('rf_n_estimators', 50)),
+                    num_cores=int(st.session_state.get('num_cores', 8)),
+                    data_signature=compute_df_signature(df),
+                )
 
                 if models and y:
                     st.subheader("Learning Curves")
                     objective_names_list = list(objective_names)
-                    visualize_model_performance(X, y, models, objective_names_list, cv_folds)
+                    visualize_model_performance(X, y, st.session_state.get('plot_estimators', models), objective_names_list, cv_folds)
 
             # Define parameter ranges
             with st.expander("Setup Training and run Optimization", expanded=False):
@@ -1799,9 +3218,17 @@ def main():
                     # Run optimization with parallel processing
                     with st.spinner("Optimizing parameters..."):
                         objective_names_list = list(objective_names)
-                        hof = optimize_parameters_parallel(param_ranges, num_objectives, models, weights, output_path,
-                                                           objective_names_list,
-                                                           st.session_state.get('objective_uncertainties', None))
+                        hof = optimize_parameters_parallel(
+                            param_ranges,
+                            num_objectives,
+                            models,
+                            weights,
+                            output_path,
+                            objective_names_list,
+                            st.session_state.get('objective_uncertainties', None),
+                            models_signature=st.session_state.get('models_signature', ''),
+                            num_cores=int(st.session_state.get('num_cores', 8)),
+                        )
 
                     if hof:
                         # Store results in session state for exploration mode
