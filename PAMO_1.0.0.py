@@ -1,31 +1,37 @@
-import streamlit as st
-import pandas as pd
+"""PAMO 1.0.2 — on-demand nested accuracy audits, based on PAMO 1.0.1."""
+from pathlib import Path
+from io import BytesIO
+from itertools import product, islice
+import math
+import os
+import time
+import hashlib
 import numpy as np
-from PIL.ImageChops import lighter
-from deap import base, creator, tools
-import itertools
+import pandas as pd
+import streamlit as st
+import plotly.graph_objects as go
+import plotly.express as px
+from plotly.subplots import make_subplots
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import PolynomialFeatures, StandardScaler
 from sklearn.linear_model import Ridge, RidgeCV
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.base import BaseEstimator, RegressorMixin
-from sklearn.model_selection import KFold, cross_val_score, cross_val_predict, learning_curve
+from sklearn.model_selection import KFold, learning_curve
 from sklearn.metrics import r2_score, mean_absolute_error
-import matplotlib.pyplot as plt
-import plotly.graph_objects as go
-import plotly.express as px
-import time
-import os
-import pickle
-import tempfile
 from typing import Optional
-from functools import partial
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import matplotlib.cm as cm
+
+VERSION = "1.0.2"
+DEFAULT_RIDGE_ALPHAS = (0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0)
+DEFAULT_RF_TREES_CV = 120
+DEFAULT_RF_MIN_SAMPLES_LEAF = 2
+SIMPLE_MODEL_TIE_TOL = 0.02
+HYBRID_MIN_GAIN_TOL = 0.01
+DEFAULT_RF_GRID = [dict(min_samples_leaf=leaf, max_depth=depth, max_features="sqrt")
+                   for depth in (None, 12) for leaf in (1, 2, 4)]
+SCORE_COLORS = [[0, "#b84040"], [0.5, "#efcf69"], [1, "#16804a"]]
 
 
-# --- Data signature helper (for reliable caching) ---
 def compute_df_signature(df) -> str:
     """Return a stable hash for a pandas DataFrame content + columns.
 
@@ -51,8 +57,6 @@ def compute_df_signature(df) -> str:
         except Exception:
             return 'fallback:unknown'
 
-
-# --- Poly(deg=2)+Ridge helpers (PAMO 1.1.14) ---
 
 def build_poly2_ridge(alpha: float) -> Pipeline:
     """Create a Poly(deg=2)+Scaler+Ridge pipeline that predicts a single objective."""
@@ -114,8 +118,7 @@ class RandomForestSurrogate:
         return np.sqrt(self.sigma_floor ** 2 + np.asarray(rf_std) ** 2)
 
 
-
-class HybridEstimator(BaseEstimator, RegressorMixin):
+class HybridEstimator(RegressorMixin, BaseEstimator):
     """sklearn-compatible estimator for the Hybrid surrogate.
 
     Hybrid model: y = Ridge(Poly2(x)) + RF_residual(x)
@@ -216,7 +219,6 @@ class HybridSurrogate:
         return np.sqrt(self.sigma_floor ** 2 + np.asarray(rf_std) ** 2)
 
 
-
 def compute_param_sensitivity_from_poly_ridge(model: Pipeline, base_feature_names) -> np.ndarray:
     """
     Compute a parameter-level sensitivity vector (length = number of original parameters),
@@ -260,861 +262,6 @@ def compute_param_sensitivity_from_poly_ridge(model: Pipeline, base_feature_name
 
     except Exception:
         return np.zeros(len(base_feature_names), dtype=float)
-
-st.set_page_config(
-    initial_sidebar_state="collapsed",  # Optional
-    page_title="WSGT_PAMO Machine Learning",
-    page_icon="Pamo_Icon_White.png",
-    layout="wide"
-)
-
-st.sidebar.image("Pamo_Icon_Black.png", width=80)
-st.sidebar.write("## WSGT_PAMO")
-st.sidebar.write("Version 1.1.10")
-st.sidebar.write("Dynamic Solver + Cache")
-st.sidebar.markdown("---")
-
-col1, col2 = st.columns(2)
-
-with col2:
-    st.image("WS_Logo.png", width=900)
-
-st.title("Machine Learning Assisted Optimization")
-
-
-# Create a multi-objective fitness class with variable number of objectives
-def create_fitness_class(num_objectives, weights):
-    if 'FitnessMulti' in creator.__dict__:
-        del creator.FitnessMulti
-    creator.create("FitnessMulti", base.Fitness, weights=tuple(weights))
-    return creator.FitnessMulti
-
-
-# Create an individual class
-def create_individual_class(num_objectives, weights):
-    if 'Individual' in creator.__dict__:
-        del creator.Individual
-    creator.create("Individual", list, fitness=create_fitness_class(num_objectives, weights), uncertainty=list)
-
-
-# Generate parameter combinations - lazy evaluation
-def parameter_combinations_generator(param_ranges):
-    """Generate parameter combinations on-demand without storing all in memory.
-
-    param_ranges: dict {param_name: (min_val, max_val, step)}
-    Returns: (generator, total_combinations)
-    """
-    param_values = []
-    for min_val, max_val, step in param_ranges.values():
-        if float(min_val) == float(max_val):
-            param_values.append([float(min_val)])
-        else:
-            min_val = float(min_val)
-            max_val = float(max_val)
-            step = float(step)
-            if step <= 0:
-                param_values.append([min_val])
-            else:
-                param_values.append(np.arange(min_val, max_val + step / 2.0, step))
-
-    total_combinations = 1
-    for values in param_values:
-        total_combinations *= len(values)
-
-    return itertools.product(*param_values), total_combinations
-
-# Function to load data from Excel file
-def load_data(num_objectives):
-    uploaded_file = st.file_uploader("Upload Training Data Excel file", type=["xlsx"])
-    if uploaded_file is not None:
-        try:
-            df = pd.read_excel(uploaded_file, engine='openpyxl')
-            if len(df.columns) < num_objectives:
-                st.error(
-                    f"Number of objectives ({num_objectives}) exceeds number of columns in the file ({len(df.columns)}).")
-                return None
-            return df
-        except Exception as e:
-            st.error(f"Error loading file: {e}")
-    return None
-
-
-# (preprocess_and_train_with_cv is defined later with per-objective auto model selection)
-
-
-def visualize_model_performance(X, y, estimators, objective_names, cv_folds=5):
-    """
-    Plot learning curves (R²) for each objective.
-
-    Why this sometimes failed on Windows/Streamlit:
-      - sklearn.learning_curve uses joblib for parallel CV when n_jobs > 1.
-      - In some Windows/Streamlit setups, process-based parallelism can raise OSError: [Errno 22] Invalid argument.
-    Mitigation:
-      - Prefer a thread-based backend for learning curves.
-      - If it still fails, fall back to single-thread execution.
-    """
-    try:
-        if X is None or y is None or not estimators:
-            st.warning("No models or data available for learning curves.")
-            return
-
-        # y is expected as list/array of per-objective vectors
-        n_obj = len(y)
-        if n_obj == 0:
-            st.warning("No objectives available for learning curves.")
-            return
-
-        fig, axes = plt.subplots(1, n_obj, figsize=(4.2 * n_obj, 4.2), frameon=False)
-        if n_obj == 1:
-            axes = [axes]
-
-        # CV folds cannot exceed the sample count
-        cv_folds_int = int(cv_folds) if cv_folds is not None else 5
-        cv_folds_int = min(max(2, cv_folds_int), len(X))
-
-        # Training sizes: fractions are OK; keep count small for speed
-        train_sizes = np.linspace(0.2, 1.0, min(8, max(2, len(X))))
-
-        # Use thread backend to avoid Windows process-spawn issues inside Streamlit
-        n_jobs_req = max(1, int(st.session_state.get('num_cores', 1)))
-
-        from joblib import parallel_backend
-
-        for i, (y_i, est, ax, obj_name) in enumerate(zip(y, estimators, axes, objective_names)):
-            try:
-                with parallel_backend("threading", n_jobs=n_jobs_req):
-                    ts, train_scores, test_scores = learning_curve(
-                        est,
-                        X,
-                        y_i,
-                        cv=cv_folds_int,
-                        n_jobs=n_jobs_req,
-                        train_sizes=train_sizes,
-                        scoring="r2"
-                    )
-            except Exception:
-                # Fall back to single-threaded execution as a last resort
-                ts, train_scores, test_scores = learning_curve(
-                    est,
-                    X,
-                    y_i,
-                    cv=cv_folds_int,
-                    n_jobs=1,
-                    train_sizes=train_sizes,
-                    scoring="r2"
-                )
-
-            try:
-                train_mean = np.mean(train_scores, axis=1)
-                train_std = np.std(train_scores, axis=1)
-                test_mean = np.mean(test_scores, axis=1)
-                test_std = np.std(test_scores, axis=1)
-
-                ax.plot(ts, train_mean, marker="o", label="Training R²")
-                ax.fill_between(ts, train_mean - train_std, train_mean + train_std, alpha=0.15)
-
-                ax.plot(ts, test_mean, marker="o", label="CV R²")
-                ax.fill_between(ts, test_mean - test_std, test_mean + test_std, alpha=0.15)
-
-                ax.set_title(f"Learning Curve - {obj_name}")
-                ax.set_xlabel("Training samples")
-                ax.set_ylabel("R²")
-                ax.grid(True, linestyle="--", alpha=0.5)
-                ax.legend(loc="best", fontsize=8)
-            except Exception as e:
-                ax.text(0.5, 0.5, f"Plot error: {str(e)}", ha="center", va="center")
-                ax.set_title(f"Learning Curve - {obj_name} (Plot error)")
-
-        plt.tight_layout()
-        st.pyplot(fig)
-
-    except Exception as e:
-        st.error(f"Error visualizing learning curves: {e}")
-
-
-def evaluate_batch(batch_params, models, num_objectives, objective_uncertainties=None):
-    results = []
-
-    for params in batch_params:
-        params_array = np.array([params])
-
-        predictions = []
-        uncertainties = []
-
-        for obj_idx, model in enumerate(models):
-            # Prediction
-            try:
-                pred_val = float(model.predict(params_array)[0])
-            except Exception:
-                pred_val = 0.0
-
-            # Uncertainty: hybrid if available; fallback to constant list
-            if hasattr(model, "predict_uncertainty"):
-                try:
-                    unc_val = float(np.asarray(model.predict_uncertainty(params_array))[0])
-                except Exception:
-                    unc_val = 0.0
-            elif objective_uncertainties is not None and obj_idx < len(objective_uncertainties):
-                unc_val = float(objective_uncertainties[obj_idx])
-            else:
-                unc_val = 0.0
-
-            predictions.append(pred_val)
-            uncertainties.append(unc_val)
-
-        # Ensure correct length
-        if len(predictions) != num_objectives:
-            if len(predictions) < num_objectives:
-                predictions = predictions + [0.0] * (num_objectives - len(predictions))
-            else:
-                predictions = predictions[:num_objectives]
-
-        if len(uncertainties) != num_objectives:
-            if len(uncertainties) < num_objectives:
-                uncertainties = uncertainties + [0.0] * (num_objectives - len(uncertainties))
-            else:
-                uncertainties = uncertainties[:num_objectives]
-
-        rounded_fitness = [f"{float(fit_val):.2f}" for fit_val in predictions]
-        rounded_uncertainty = [f"{float(unc_val):.2f}" for unc_val in uncertainties]
-
-        results.append({
-            'params': params,
-            'predictions': predictions,
-            'uncertainties': uncertainties,
-            'rounded_fitness': rounded_fitness,
-            'rounded_uncertainty': rounded_uncertainty
-        })
-
-    return results
-
-
-def process_completed_results(async_results, hof, temp_results_file,
-                              processed_count, total_combinations,
-                              progress_bar, status_text, start_time):
-    """Process any completed async results"""
-    # Check which results are ready
-    completed_indices = []
-    for i, (future, batch_size) in enumerate(async_results):
-        if future.done():
-            completed_indices.append(i)
-
-            try:
-                # Get the result
-                result_batch = future.result()
-            except Exception as e:
-                st.error(f"Error in batch processing: {e}")
-                continue
-
-            # Process results and update Pareto front
-            with open(temp_results_file, 'a') as f:
-                for result in result_batch:
-                    # Create individual
-                    individual = creator.Individual(result['params'])
-                    individual.fitness.values = tuple(result['predictions'])
-                    individual.weighted_sum = 0.0  # to be calculated after normalization
-                    individual.uncertainty = tuple(result['uncertainties'])
-
-                    # Update Pareto front
-                    hof.update([individual])
-
-                    # Write to CSV directly to save memory
-                    row_data = [str(float(p)) for p in result['params']] + result['rounded_fitness'] + result[
-                        'rounded_uncertainty']
-                    f.write(','.join(row_data) + '\n')
-
-            # Update progress
-            processed_count += batch_size
-            progress = min(1.0, processed_count / total_combinations)
-            progress_bar.progress(progress)
-
-            elapsed_time = time.time() - start_time
-            estimated_total = elapsed_time / progress if progress > 0 else 0
-            remaining_time = estimated_total - elapsed_time
-
-            status_text.text(f"Processed {processed_count}/{total_combinations} combinations. " +
-                             f"Elapsed: {elapsed_time:.2f}s. Estimated remaining: {remaining_time:.2f}s.")
-
-    # Remove completed results
-    for i in sorted(completed_indices, reverse=True):
-        async_results.pop(i)
-
-    return processed_count
-
-
-# Function to perform streaming optimization with optimized parallel processing
-@st.cache_resource
-def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights, output_path, objective_names, objective_uncertainties=None, models_signature: str = "", num_cores: int = 1):
-    try:
-        st.write("Starting optimization process with streaming parallel processing...")
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-
-        start_time = time.time()
-
-        hof = tools.ParetoFront()
-
-        # Get parameter combinations generator and total count
-        param_generator, total_combinations = parameter_combinations_generator(param_ranges)
-
-        st.write(f"Total parameter combinations to evaluate: {total_combinations}")
-
-        # Threads for parallel evaluation (caps to available CPU cores)
-        requested_cores = int(num_cores) if num_cores is not None else int(st.session_state.get('num_cores', 8))
-        available_cores = os.cpu_count() or requested_cores
-        num_cores = max(1, min(requested_cores, available_cores))
-        st.write(f"Using {num_cores} threads for processing (requested: {requested_cores}, available: {available_cores})")
-
-        # Calculate optimal batch size for Streamlit Cloud (smaller batches for stability)
-        if total_combinations < 1000:
-            batch_size = max(1, min(250, total_combinations // 10))
-        elif total_combinations < 10000:
-            batch_size = max(5, min(500, total_combinations // 20))
-        else:
-            batch_size = max(10, min(1000, total_combinations // 50))  # Much smaller batches for large datasets
-
-        st.write(f"Using adaptive batch size: {batch_size}")
-
-        # Prepare for streaming processing
-        processed_count = 0
-        batch_count = 0
-
-        # Prepare column labels for the DataFrame
-        param_labels = list(param_ranges.keys())
-        fitness_labels = list(objective_names)
-        uncertainty_labels = [f'Uncertainty_{name}' for name in objective_names]
-
-        # Create DataFrame for results with chunked writing
-        df_columns = param_labels + fitness_labels + uncertainty_labels
-
-        # Create a temporary file for results
-        temp_results_file = "temp_results.csv"
-        with open(temp_results_file, 'w') as f:
-            # Write header
-            f.write(','.join(df_columns) + '\n')
-
-        # Create a pool of worker threads (more Streamlit-friendly than processes)
-        with ThreadPoolExecutor(max_workers=num_cores) as executor:
-            # Use a queue of async results to maximize CPU utilization
-            async_results = []
-            batches = []
-            current_batch = []
-
-            # Process parameter combinations in streaming batches
-            for i, params in enumerate(param_generator):
-                current_batch.append(params)
-
-                # When batch is full, submit it asynchronously
-                if len(current_batch) >= batch_size:
-                    batch_count += 1
-                    batches.append(current_batch)
-
-                    # Submit batch for async processing
-                    future = executor.submit(evaluate_batch, current_batch, _models, num_objectives, objective_uncertainties)
-                    async_results.append((future, len(current_batch)))
-
-                    # Reset current batch
-                    current_batch = []
-
-                # Process completed results to free up memory
-                processed_count = process_completed_results(
-                    async_results, hof, temp_results_file,
-                    processed_count, total_combinations,
-                    progress_bar, status_text, start_time
-                )
-
-                # Periodic memory cleanup and progress check
-                if i % 100 == 0:
-                    import gc
-                    gc.collect()
-            # Submit any remaining combinations
-            if current_batch:
-                batch_count += 1
-                batches.append(current_batch)
-
-                # Submit batch for async processing
-                future = executor.submit(evaluate_batch, current_batch, _models, num_objectives, objective_uncertainties)
-                async_results.append((future, len(current_batch)))
-
-            # Wait for all remaining results to complete
-            while async_results:
-                processed_count = process_completed_results(
-                    async_results, hof, temp_results_file,
-                    processed_count, total_combinations,
-                    progress_bar, status_text, start_time
-                )
-                time.sleep(0.1)  # Short sleep to prevent CPU spinning
-
-        # Complete progress bar
-        progress_bar.progress(1.0)
-
-        # Read results from temporary file
-        results_df = pd.read_csv(temp_results_file, encoding='latin-1')
-
-        # Calculate weighted sum for each solution
-        if 'Weighted Sum' not in results_df.columns:
-            # Normalize and calculate weighted sum
-            weighted_sum = np.zeros(len(results_df))
-            for i, (obj, w) in enumerate(zip(fitness_labels, weights)):
-                col_values = results_df[obj].astype(float)
-                v_min = col_values.min()
-                v_max = col_values.max()
-
-                if v_max == v_min:
-                    normalized = np.zeros_like(col_values)
-                elif w < 0:
-                    normalized = w * (v_max - col_values) / (v_max - v_min)
-                else:
-                    normalized = w * (col_values - v_min) / (v_max - v_min)
-
-                weighted_sum += normalized
-
-            results_df['Weighted Sum'] = weighted_sum
-            for ind, wsum in zip(hof, weighted_sum):
-                ind.weighted_sum = wsum
-
-        # Save results to Excel file if not too large
-        try:
-            if len(results_df) <= 1048576:  # Excel row limit
-                results_df.to_excel(output_path, index=False)
-                st.success(f"Results saved to {output_path}")
-                # Store the output path in session state for later use
-                st.session_state['output_path'] = output_path
-            else:
-                csv_path = output_path.replace('.xlsx', '.csv')
-                results_df.to_csv(csv_path, index=False)
-                st.warning(f"Results too large for Excel. Saved to {csv_path} instead.")
-                # Store the CSV path in session state for later use
-                st.session_state['output_path'] = csv_path
-        except Exception as e:
-            st.error(f"Error saving results: {e}")
-            # Fallback to CSV
-            try:
-                csv_path = output_path.replace('.xlsx', '.csv')
-                results_df.to_csv(csv_path, index=False)
-                st.success(f"Results saved to {csv_path}")
-                # Store the CSV path in session state for later use
-                st.session_state['output_path'] = csv_path
-            except:
-                st.error("Failed to save results to file.")
-
-        # Clean up temporary file
-        try:
-            os.remove(temp_results_file)
-        except:
-            pass
-
-        # Display optimization summary
-        st.write(f"Optimization completed in {time.time() - start_time:.2f} seconds")
-        st.write(f"Evaluated {processed_count} parameter combinations")
-        st.write(f"Found {len(hof)} solutions on the Pareto front")
-
-        return hof
-
-    except Exception as e:
-        st.error(f"Error in optimization: {e}")
-        import traceback
-        st.code(traceback.format_exc())
-        return None
-
-
-# Helper function to normalize weighted sum consistently
-def normalize_weighted_sum(objective_values, weights):
-    """Calculate normalized weighted sum for given objective values and weights"""
-    weighted_sum = 0.0
-
-    for i, (obj_vals, w) in enumerate(zip(objective_values.T, weights)):
-        v_min = obj_vals.min()
-        v_max = obj_vals.max()
-
-        if v_max == v_min:
-            normalized = np.zeros_like(obj_vals)
-        elif w < 0:
-            normalized = w * (v_max - obj_vals) / (v_max - v_min)
-        else:
-            normalized = w * (obj_vals - v_min) / (v_max - v_min)
-
-        weighted_sum += normalized
-
-    return weighted_sum
-
-
-# Helper function to create dimension for parallel coordinates plot with non-overlapping tick labels
-def create_dimension(label, values, min_val, max_val):
-    """Create a dimension for parallel coordinates with clean tick labels"""
-    # Let Plotly handle tick positioning automatically for better readability
-    # Only specify range and let Plotly determine optimal tick positions
-    if min_val == max_val:
-        # Handle edge case where all values are the same
-        return dict(
-            range=[min_val - 0.1, max_val + 0.1],
-            label=label,
-            values=values
-        )
-    else:
-        return dict(
-            range=[min_val, max_val],
-            label=label,
-            values=values
-        )
-
-
-# Visualize Pareto front using Plotly for interactivity
-def visualize_pareto_front(hof, objective_names_list, param_names_list, weights):
-    try:
-        # Ensure objective_names_list and param_names_list are lists
-        objective_names_list = list(objective_names_list)
-        param_names_list = list(param_names_list)
-
-        # Extract objective values for all solutions
-        objective_values = np.array([list(ind.fitness.values) for ind in hof])
-
-        # Calculate weighted sum for each solution
-        weighted_sums = np.array([ind.weighted_sum for ind in hof])
-
-        # Create a DataFrame for the parallel coordinates plot
-        data = []
-        for i, ind in enumerate(hof):
-            solution_data = {}
-            # Add parameter values
-            for j, param_name in enumerate(param_names_list):
-                solution_data[param_name] = float(ind[j])
-
-            # Add objective values
-            for j, obj_name in enumerate(objective_names_list):
-                solution_data[obj_name] = float(ind.fitness.values[j])
-
-            # Add weighted sum and solution ID
-            solution_data['Weighted Sum'] = float(weighted_sums[i])
-            solution_data['Solution ID'] = i
-
-            data.append(solution_data)
-
-        df = pd.DataFrame(data)
-
-        # Create parallel coordinates plot with Plotly
-        dimensions = []
-
-        # Add parameter dimensions with non-overlapping tick labels
-        for param in param_names_list:
-            param_min = df[param].min()
-            param_max = df[param].max()
-            dimensions.append(create_dimension(param, df[param], param_min, param_max))
-
-        # Add objective dimensions with non-overlapping tick labels
-        for obj in objective_names_list:
-            obj_min = df[obj].min()
-            obj_max = df[obj].max()
-            dimensions.append(create_dimension(obj, df[obj], obj_min, obj_max))
-
-        # Add weighted sum dimension at the far right
-        ws_min = df['Weighted Sum'].min()
-        ws_max = df['Weighted Sum'].max()
-        dimensions.append(create_dimension('Weighted Sum', df['Weighted Sum'], ws_min, ws_max))
-
-        # Create the parallel coordinates plot
-        with st.expander("Optimization Result (Pareto Front)", expanded=False):
-            st.write("## Solutions in Pareto Front")
-            st.write("Here you find the non-dominated solutions in Pareto Front")
-            fig = go.Figure(data=
-            go.Parcoords(
-                line=dict(
-                    color=df['Weighted Sum'],
-                    colorscale='Tealrose',
-                    showscale=True,
-                    colorbar=dict(title='Weighted Sum', nticks=11)
-                ),
-                dimensions=dimensions,
-                unselected=dict(line=dict(opacity=0)),
-                rangefont=dict(family="Arial", size=14),
-                tickfont=dict(family="Arial", size=11, weight="bold", color="black"),
-
-            )
-            )
-
-            fig.update_layout(
-                title="Solutions in Pareto Front",
-                height=600,
-                margin=dict(l=50, r=50, t=100, b=50),  # Increased left and right margins for axis labels
-                font=dict(family='Arial', size=14)  # Reduced font size to prevent overlapping
-            )
-
-            # Display the interactive plot
-            st.plotly_chart(fig, use_container_width=True)
-
-    except Exception as e:
-        st.error(f"Error visualizing Pareto front: {e}")
-        import traceback
-        st.code(traceback.format_exc())
-
-
-# Visualize a single selected solution
-def visualize_selected_solution(solution, param_names, objective_names, weights, hof):
-    try:
-        st.write("## Interactive Solution Explorer")
-        st.write("Here you can isolate and investigate a specific non-dominated solutions from Pareto Front")
-        st.subheader("Selected Solution Details")
-
-        # Ensure param_names and objective_names are lists
-        param_names = list(param_names)
-        objective_names = list(objective_names)
-
-        # Create tables for parameter and objective values (formatted to exactly 2 decimal places)
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.write("Parameter Values")
-            param_df = pd.DataFrame({
-                'Parameter': param_names,
-                'Value': [f"{float(p):.2f}" for p in solution]  # Format to exactly 2 decimal places
-            })
-            st.table(param_df)
-
-        with col2:
-            st.write("Objective Values")
-            obj_df = pd.DataFrame({
-                'Objective': objective_names,
-                'Value': [f"{float(f):.2f}" for f in solution.fitness.values],  # Format to exactly 2 decimal places
-                '(±)': [f"{float(u):.2f}" for u in solution.uncertainty],
-                # Format to exactly 2 decimal places
-                'Weight': [f"{float(w):.2f}" for w in weights]  # Format to exactly 2 decimal places
-            })
-            st.table(obj_df)
-
-        # Create the parallel coordinates plot for the selected solution using Plotly for consistency
-        # Combine parameter values and objective values for visualization
-        all_names = param_names + objective_names
-
-        # Extract all data for all solutions (parameters + objectives)
-        all_data = []
-        for ind in hof:
-            solution_data = {}
-            # Add parameter values
-            for j, param_name in enumerate(param_names):
-                solution_data[param_name] = float(ind[j])
-
-            # Add objective values
-            for j, obj_name in enumerate(objective_names):
-                solution_data[obj_name] = float(ind.fitness.values[j])
-
-            # Add solution ID
-            solution_data['is_selected'] = 0  # Not selected
-
-            all_data.append(solution_data)
-
-        # Add selected solution data
-        selected_data = {}
-        # Add parameter values
-        for j, param_name in enumerate(param_names):
-            selected_data[param_name] = float(solution[j])
-
-        # Add objective values
-        for j, obj_name in enumerate(objective_names):
-            selected_data[obj_name] = float(solution.fitness.values[j])
-
-        # Mark as selected
-        selected_data['is_selected'] = 1  # Selected
-
-        # Create DataFrame with all solutions
-        df_all = pd.DataFrame(all_data)
-        df_selected = pd.DataFrame([selected_data])
-
-        # Combine all data
-        df_combined = pd.concat([df_all, df_selected])
-
-        # Create dimensions for parallel coordinates with non-overlapping tick labels
-        dimensions = []
-        for name in all_names:
-            name_min = df_combined[name].min()
-            name_max = df_combined[name].max()
-            dimensions.append(create_dimension(name, df_combined[name], name_min, name_max))
-
-        # Create figure
-        fig = go.Figure(data=
-        go.Parcoords(
-            line=dict(
-                color=df_combined['is_selected'],
-                colorscale=[[0, 'rgba(250,250,250,0.5)'], [1, 'rgba(255,0,0,1)']],
-                showscale=False
-            ),
-            dimensions=dimensions,
-            unselected=dict(line=dict(opacity=0)),
-            rangefont=dict(family="Arial", size=14),
-            tickfont=dict(family="Arial", size=12, weight="bold", color="black")
-        )
-        )
-
-        fig.update_layout(
-            title="Selected Solution",
-            height=600,
-            margin=dict(l=50, r=50, t=100, b=50),  # Increased margins for labels
-            font=dict(family="Arial", size=14)  # Smaller font to prevent overlap
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-
-    except Exception as e:
-        st.error(f"Error visualizing selected solution: {e}")
-        import traceback
-        st.code(traceback.format_exc())
-
-
-# Visualize parameter trends
-def visualize_parameter_trends(hof, param_names, objective_names):
-    with st.expander("Trend Analysis", expanded=False):
-        try:
-            st.write("## Trend Analysis")
-            st.write("Here you can investigate how each parameter affects objectives")
-            # Ensure param_names and objective_names are lists
-            param_names = list(param_names)
-            objective_names = list(objective_names)
-
-            # Extract data for all solutions
-            param_data = np.zeros((len(hof), len(param_names)))
-            objective_data = np.zeros((len(hof), len(objective_names)))
-
-            for i, ind in enumerate(hof):
-                # Add parameter values
-                for j, param in enumerate(ind):
-                    param_data[i, j] = float(param)
-
-                # Add objective values
-                for j, obj in enumerate(ind.fitness.values):
-                    objective_data[i, j] = float(obj)
-
-            # Create a trend diagram for each parameter
-            for p_idx, param_name in enumerate(param_names):
-                st.subheader(f"Parameter: {param_name}")
-
-                # Create a figure with subplots for each objective (without frame)
-                fig, axes = plt.subplots(1, len(objective_names), figsize=(15, 4), frameon=False)
-                if len(objective_names) == 1:
-                    axes = [axes]
-
-                for o_idx, (obj_name, ax) in enumerate(zip(objective_names, axes)):
-                    # Extract parameter and objective values
-                    x = param_data[:, p_idx]
-                    y = objective_data[:, o_idx]
-
-                    # Plot scatter points
-                    ax.scatter(x, y, alpha=0.5, color='green')
-
-                    # Add trendline if there are enough points
-                    if len(x) > 1:
-                        try:
-                            # Fit a polynomial of degree 1 (linear) or 2 (quadratic) based on data size
-                            degree = 2 if len(x) > 5 else 1
-                            z = np.polyfit(x, y, degree)
-                            p = np.poly1d(z)
-
-                            # Generate x values for the trendline
-                            x_trend = np.linspace(min(x), max(x), 100)
-
-                            # Plot the trendline
-                            ax.plot(x_trend, p(x_trend), "r--")
-                        except:
-                            # If fitting fails, skip trendline
-                            pass
-
-                    ax.set_xlabel(param_name)
-                    ax.set_ylabel(obj_name)
-                    ax.set_title(f"{param_name} vs {obj_name}")
-                    ax.grid(True, linestyle='--', alpha=0.7)
-
-                plt.tight_layout()
-                st.pyplot(fig)
-
-        except Exception as e:
-            st.error(f"Error visualizing parameter trends: {e}")
-            import traceback
-            st.code(traceback.format_exc())
-
-
-# Initialize session state variables
-def initialize_session_state():
-    if 'models' not in st.session_state:
-        st.session_state['models'] = []
-
-    if 'optimization_complete' not in st.session_state:
-        st.session_state['optimization_complete'] = False
-
-    if 'hof' not in st.session_state:
-        st.session_state['hof'] = None
-
-    if 'param_names' not in st.session_state:
-        st.session_state['param_names'] = []
-
-    if 'objective_names' not in st.session_state:
-        st.session_state['objective_names'] = []
-
-    if 'weights' not in st.session_state:
-        st.session_state['weights'] = []
-
-    if 'selected_solution_index' not in st.session_state:
-        st.session_state['selected_solution_index'] = 0
-
-    if 'active_tab' not in st.session_state:
-        st.session_state['active_tab'] = "Training"
-
-    if 'num_cores' not in st.session_state:
-        st.session_state['num_cores'] = 8
-
-    if 'output_path' not in st.session_state:
-        st.session_state['output_path'] = "evaluated_solutions.xlsx"
-
-
-# Callback for solution selection
-def on_solution_select():
-    # This function will be called when a solution is selected
-    # Get the key that triggered the callback
-    for key in st.session_state:
-        if key.startswith('solution_selector_') and st.session_state[key] != st.session_state.get(
-                'selected_solution_index', 0):
-            st.session_state['selected_solution_index'] = st.session_state[key]
-            break
-
-
-# Function to display optimization results in a separate mode
-def display_optimization_results():
-    st.title("Optimization Results Explorer")
-    st.write("Explore optimization results")
-
-    # Get data from session state
-    hof = st.session_state['hof']
-    param_names_list = st.session_state['param_names']
-    objective_names_list = st.session_state['objective_names']
-    weights = st.session_state['weights']
-    if not hof:
-        st.error("No optimization results found.")
-        return
-
-    # Display Pareto front visualization
-    visualize_pareto_front(hof, objective_names_list, param_names_list, weights)
-
-    # Display Parameter Trend Analysis (only once)
-    visualize_parameter_trends(hof, param_names_list, objective_names_list)
-
-    # Recalculate normalized weighted sum for consistent display
-    objective_values = np.array([list(ind.fitness.values) for ind in hof])
-    normalized_weighted_sums = normalize_weighted_sum(objective_values, weights)
-
-    # Update the weighted sum in each individual
-    for ind, norm_wsum in zip(hof, normalized_weighted_sums):
-        ind.weighted_sum = norm_wsum
-
-    # Sort solutions by normalized weighted sum (lowest to highest)
-    sorted_solutions = sorted(range(len(hof)), key=lambda i: hof[i].weighted_sum, reverse=False)
-
-    # Create a mappin
-# --- Model selection (Auto/Manual) helpers (PAMO 1.1.14) ---
-
-DEFAULT_RIDGE_ALPHAS = (0.001, 0.003, 0.01, 0.03, 0.1, 0.3, 1.0, 3.0, 10.0)
-DEFAULT_RF_TREES_FINAL = 150
-DEFAULT_RF_TREES_CV = 120
-DEFAULT_RF_MIN_SAMPLES_LEAF = 2
-
-SIMPLE_MODEL_TIE_TOL = 0.02      # 2%: if Ridge is within 2% of best NMAE, prefer Ridge
-HYBRID_MIN_GAIN_TOL = 0.01       # 1%: require Hybrid to beat best single model by >1% to justify complexity
 
 
 def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray):
@@ -1176,7 +323,6 @@ def _cv_eval_ridge(X: pd.DataFrame, y: np.ndarray, cv: KFold, ridge_mode: str, r
         "sigma_floor": sigma_floor,
         "fold_alphas": fold_alphas
     }
-
 
 
 def _cv_eval_rf(X: pd.DataFrame, y: np.ndarray, cv: KFold, n_estimators: int, n_jobs: int,
@@ -1315,16 +461,6 @@ def _choose_model_kind(ridge_info, rf_info, hybrid_info):
     return best_kind
 
 
-# Light-weight RF hyperparameter tuning (kept small for interactive use)
-DEFAULT_RF_GRID = [
-    {"min_samples_leaf": 1, "max_depth": None, "max_features": "sqrt"},
-    {"min_samples_leaf": 2, "max_depth": None, "max_features": "sqrt"},
-    {"min_samples_leaf": 4, "max_depth": None, "max_features": "sqrt"},
-    {"min_samples_leaf": 1, "max_depth": 12, "max_features": "sqrt"},
-    {"min_samples_leaf": 2, "max_depth": 12, "max_features": "sqrt"},
-    {"min_samples_leaf": 4, "max_depth": 12, "max_features": "sqrt"},
-]
-
 def _cv_select_best_rf(X: pd.DataFrame, y: np.ndarray, cv: KFold, n_estimators: int, n_jobs: int,
                        grid=DEFAULT_RF_GRID):
     """Evaluate a small RF grid and return the best config by CV NMAE."""
@@ -1342,6 +478,7 @@ def _cv_select_best_rf(X: pd.DataFrame, y: np.ndarray, cv: KFold, n_estimators: 
         if best is None or info["nmae"] < best["nmae"]:
             best = info
     return best
+
 
 def _cv_select_best_hybrid(X: pd.DataFrame, y: np.ndarray, cv: KFold, ridge_mode: str, ridge_alpha: float,
                            n_estimators: int, n_jobs: int, grid=DEFAULT_RF_GRID):
@@ -1363,1905 +500,1025 @@ def _cv_select_best_hybrid(X: pd.DataFrame, y: np.ndarray, cv: KFold, ridge_mode
             best = info
     return best
 
-# Function to preprocess data and train model with cross-validation
-@st.cache_resource(show_spinner=False, hash_funcs={pd.DataFrame: compute_df_signature})
-def preprocess_and_train_with_cv(df, num_objectives, ridge_alpha=0.1, cv_folds=5,
-                                 model_selection_mode="Auto", objective_model_overrides=None, store_in_session: bool = True, rf_n_estimators: int = 150, num_cores: int = 8, data_signature: str = ""):
-    """
-    Train one surrogate per objective, with per-objective model selection.
 
-    Candidate models (per objective):
-      - Ridge: Poly(deg=2)+Scaler+RidgeCV (auto) or Ridge(alpha) (manual)
-      - Random Forest
-      - Hybrid: Ridge baseline + RF residual corrector
+def train_models(df, num_objectives, ridge_alpha=0.1, cv_folds=5,
+                 model_selection_mode="Auto", objective_model_overrides=None,
+                 rf_n_estimators=50, num_cores=1):
+    validate_training_data(df, num_objectives)
+    if objective_model_overrides is None:
+        objective_model_overrides = {}
 
-    Selection criterion:
-      - Primary: CV NMAE (MAE normalized by target range)
-      - Reported: CV R² + MAE + NMAE
-      - Bias: prefer Ridge if within SIMPLE_MODEL_TIE_TOL of best;
-              choose Hybrid only if it beats best single model by > HYBRID_MIN_GAIN_TOL
+    X = df.drop(df.columns[-num_objectives:], axis=1)
+    y_list = [df[col] for col in df.columns[-num_objectives:]]
+    objective_names = list(df.columns[-num_objectives:])
 
-    Manual override:
-      objective_model_overrides can specify "Ridge", "Random Forest", "Hybrid", or "Auto" per objective name.
-    """
-    try:
-        if objective_model_overrides is None:
-            objective_model_overrides = {}
+    # CV setup
+    n_splits = int(min(max(2, cv_folds), len(X)))
+    cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
 
-        X = df.drop(df.columns[-num_objectives:], axis=1)
-        y_list = [df[col] for col in df.columns[-num_objectives:]]
-        objective_names = list(df.columns[-num_objectives:])
+    # Resources
+    n_jobs = int(num_cores if num_cores is not None else (os.cpu_count() or 1))
+    n_jobs = max(1, min(n_jobs, os.cpu_count() or n_jobs))
 
-        # CV setup
-        n_splits = int(min(max(2, cv_folds), len(X)))
-        cv = KFold(n_splits=n_splits, shuffle=True, random_state=42)
+    rf_trees_final = int(rf_n_estimators)
+    rf_trees_cv = int(min(DEFAULT_RF_TREES_CV, rf_trees_final))
 
-        # Resources
-        n_jobs = int(num_cores if num_cores is not None else (os.cpu_count() or 1))
-        n_jobs = max(1, min(n_jobs, os.cpu_count() or n_jobs))
+    models = []
+    plot_estimators = []  # sklearn estimators for learning curves
+    cv_scores = []
+    feature_importances = []
+    objective_uncertainties = []
+    chosen_model_kinds = []
+    per_objective_reports = []
 
-        rf_trees_final = int(rf_n_estimators)
-        rf_trees_cv = int(min(DEFAULT_RF_TREES_CV, rf_trees_final))
+    for i, (obj_name, y_series) in enumerate(zip(objective_names, y_list)):
+        y = np.asarray(y_series, dtype=float).reshape(-1)
 
-        models = []
-        plot_estimators = []  # sklearn estimators for learning curves
-        cv_scores = []
-        feature_importances = []
-        objective_uncertainties = []
-        chosen_model_kinds = []
-        per_objective_reports = []
+        # Determine whether Ridge alpha is auto-tuned for this objective
+        # Auto mode -> ridge_mode="auto"; Manual model selection -> ridge_mode="manual"
+        ridge_mode = "auto" if str(model_selection_mode).lower().startswith("auto") else "manual"
 
-        for i, (obj_name, y_series) in enumerate(zip(objective_names, y_list)):
-            y = np.asarray(y_series, dtype=float).reshape(-1)
+        # Override per objective
+        override = str(objective_model_overrides.get(obj_name, "Auto"))
+        override_norm = override.strip().lower()
 
-            # Determine whether Ridge alpha is auto-tuned for this objective
-            # Auto mode -> ridge_mode="auto"; Manual model selection -> ridge_mode="manual"
-            ridge_mode = "auto" if str(model_selection_mode).lower().startswith("auto") else "manual"
+        # Evaluate candidates (needed for Auto or for "Auto" override inside Manual mode)
+        ridge_info = _cv_eval_ridge(X, y, cv, ridge_mode=ridge_mode, ridge_alpha=float(ridge_alpha))
+        rf_info = _cv_select_best_rf(X, y, cv, n_estimators=rf_trees_cv, n_jobs=n_jobs)
+        hybrid_info = _cv_select_best_hybrid(X, y, cv, ridge_mode=ridge_mode, ridge_alpha=float(ridge_alpha), n_estimators=rf_trees_cv, n_jobs=n_jobs)
 
-            # Override per objective
-            override = str(objective_model_overrides.get(obj_name, "Auto"))
-            override_norm = override.strip().lower()
-
-            # Evaluate candidates (needed for Auto or for "Auto" override inside Manual mode)
-            ridge_info = _cv_eval_ridge(X, y, cv, ridge_mode=ridge_mode, ridge_alpha=float(ridge_alpha))
-            rf_info = _cv_select_best_rf(X, y, cv, n_estimators=rf_trees_cv, n_jobs=n_jobs)
-            hybrid_info = _cv_select_best_hybrid(X, y, cv, ridge_mode=ridge_mode, ridge_alpha=float(ridge_alpha), n_estimators=rf_trees_cv, n_jobs=n_jobs)
-
-            # Decide model kind
-            if override_norm in ("ridge", "random forest", "random_forest", "rf", "hybrid"):
-                if override_norm == "ridge":
-                    chosen = "Ridge"
-                elif override_norm in ("random forest", "random_forest", "rf"):
-                    chosen = "Random Forest"
-                else:
-                    chosen = "Hybrid"
-                selection_reason = f"Manual override: {override}"
+        # Decide model kind
+        if override_norm in ("ridge", "random forest", "random_forest", "rf", "hybrid"):
+            if override_norm == "ridge":
+                chosen = "Ridge"
+            elif override_norm in ("random forest", "random_forest", "rf"):
+                chosen = "Random Forest"
             else:
-                chosen = _choose_model_kind(ridge_info, rf_info, hybrid_info)
-                selection_reason = "Auto selection (CV NMAE + simplicity bias)"
+                chosen = "Hybrid"
+            selection_reason = f"Manual override: {override}"
+        else:
+            chosen = _choose_model_kind(ridge_info, rf_info, hybrid_info)
+            selection_reason = "Auto selection (CV NMAE + simplicity bias)"
 
-            chosen_model_kinds.append(chosen)
+        chosen_model_kinds.append(chosen)
 
-            # Select corresponding CV report
-            chosen_info = {"Ridge": ridge_info, "Random Forest": rf_info, "Hybrid": hybrid_info}[chosen]
-            sigma_floor = float(chosen_info["sigma_floor"])
-            objective_uncertainties.append(sigma_floor)
-            cv_scores.append(chosen_info["fold_scores"])
+        # Select corresponding CV report
+        chosen_info = {"Ridge": ridge_info, "Random Forest": rf_info, "Hybrid": hybrid_info}[chosen]
+        sigma_floor = float(chosen_info["sigma_floor"])
+        objective_uncertainties.append(sigma_floor)
+        cv_scores.append(chosen_info["fold_scores"])
 
-            # Train final model(s) on all data
-            if chosen == "Ridge":
-                if ridge_mode == "auto" and override_norm not in ("ridge",):
-                    final_ridge = build_poly2_ridgecv(DEFAULT_RIDGE_ALPHAS)
-                else:
-                    final_ridge = build_poly2_ridge(float(ridge_alpha))
-                final_ridge.fit(X, y)
+        # Train final model(s) on all data
+        if chosen == "Ridge":
+            if ridge_mode == "auto" and override_norm not in ("ridge",):
+                final_ridge = build_poly2_ridgecv(DEFAULT_RIDGE_ALPHAS)
+            else:
+                final_ridge = build_poly2_ridge(float(ridge_alpha))
+            final_ridge.fit(X, y)
 
-                chosen_alpha = None
-                try:
-                    ridge_step = final_ridge.named_steps.get("ridge", None)
-                    if hasattr(ridge_step, "alpha_"):
-                        chosen_alpha = float(ridge_step.alpha_)
-                except Exception:
-                    pass
-
-                surrogate = RidgeSurrogate(final_ridge, sigma_floor=sigma_floor, chosen_alpha=chosen_alpha)
-                models.append(surrogate)
-                plot_estimators.append(final_ridge)
-
-                # Sensitivity from polynomial ridge coefficients
-                sens = compute_param_sensitivity_from_poly_ridge(final_ridge, X.columns)
-                feature_importances.append(sens)
-
-            elif chosen == "Random Forest":
-                rf_params = (rf_info.get('params') or {})
-                final_rf = RandomForestRegressor(
-                    n_estimators=int(rf_trees_final),
-                    random_state=42,
-                    n_jobs=int(n_jobs) if n_jobs is not None else None,
-                    max_features=rf_params.get('max_features', 'sqrt'),
-                    max_depth=rf_params.get('max_depth', None),
-                    min_samples_leaf=int(rf_params.get('min_samples_leaf', DEFAULT_RF_MIN_SAMPLES_LEAF)),
-                )
-                final_rf.fit(X, y)
-
-                surrogate = RandomForestSurrogate(final_rf, sigma_floor=sigma_floor)
-                models.append(surrogate)
-                plot_estimators.append(final_rf)
-
-                # Parameter sensitivity from RF feature_importances_ (already parameter-level)
-                try:
-                    feature_importances.append(np.asarray(final_rf.feature_importances_, dtype=float))
-                except Exception:
-                    feature_importances.append(np.zeros(len(X.columns), dtype=float))
-
-            else:  # Hybrid
-                if ridge_mode == "auto" and override_norm not in ("hybrid",):
-                    final_ridge = build_poly2_ridgecv(DEFAULT_RIDGE_ALPHAS)
-                    ridge_auto = True
-                else:
-                    final_ridge = build_poly2_ridge(float(ridge_alpha))
-                    ridge_auto = False
-
-                final_ridge.fit(X, y)
-                resid_all = y - final_ridge.predict(X)
-
-                hyb_params = (hybrid_info.get('params') or {})
-                final_rf = RandomForestRegressor(
-                    n_estimators=int(rf_trees_final),
-                    random_state=42,
-                    n_jobs=int(n_jobs) if n_jobs is not None else None,
-                    max_features=hyb_params.get('max_features', 'sqrt'),
-                    max_depth=hyb_params.get('max_depth', None),
-                    min_samples_leaf=int(hyb_params.get('min_samples_leaf', DEFAULT_RF_MIN_SAMPLES_LEAF)),
-                )
-                final_rf.fit(X, resid_all)
-
-                surrogate = HybridSurrogate(final_ridge, final_rf, sigma_floor=sigma_floor)
-                surrogate.kind = "Hybrid"
-                models.append(surrogate)
-
-                # Provide a sklearn estimator for learning curves
-                plot_estimators.append(HybridEstimator(
-                    ridge_alpha=float(ridge_alpha),
-                    ridge_alphas=DEFAULT_RIDGE_ALPHAS,
-                    ridge_auto=ridge_auto,
-                    rf_n_estimators=int(rf_trees_final),
-                    rf_min_samples_leaf=int(hyb_params.get('min_samples_leaf', DEFAULT_RF_MIN_SAMPLES_LEAF)),
-                    rf_max_depth=hyb_params.get('max_depth', None),
-                    rf_max_features=hyb_params.get('max_features', 'sqrt'),
-                    n_jobs=int(n_jobs) if n_jobs is not None else None
-                ))
-
-                sens = compute_param_sensitivity_from_poly_ridge(final_ridge, X.columns)
-                feature_importances.append(sens)
-
-            # Build report for UI
-            per_objective_reports.append({
-                "Objective": obj_name,
-                "Selected model": chosen,
-                "Selection basis": selection_reason,
-                "Ridge CV NMAE": ridge_info["nmae"],
-                "RF CV NMAE": rf_info["nmae"],
-                "Hybrid CV NMAE": hybrid_info["nmae"],
-                "Ridge CV R2": ridge_info["r2"],
-                "RF CV R2": rf_info["r2"],
-                "Hybrid CV R2": hybrid_info["r2"],
-                "Selected CV MAE": chosen_info["mae"],
-                "Selected CV NMAE": chosen_info["nmae"],
-                "Selected CV R2": chosen_info["r2"],
-                "Uncertainty floor (CV resid std)": sigma_floor,
-            })
-
-            # Print short summary (keeps existing behavior of showing training diagnostics)
-            st.write(f"Objective {i + 1} ({obj_name}) -> Selected: **{chosen}**")
-            st.write(f"CV NMAE: Ridge={ridge_info['nmae']:.3f} | RF={rf_info['nmae']:.3f} | Hybrid={hybrid_info['nmae']:.3f}")
-            if np.isfinite(chosen_info['r2']):
-                st.write(f"Selected CV R²: {chosen_info['r2']:.2f} (folds: {[f'{s:.2f}' if np.isfinite(s) else 'nan' for s in chosen_info['fold_scores']]})")
-            st.write(f"Estimated uncertainty floor (CV residual std): {sigma_floor:.2f}")
-            st.markdown("---")
-
-        # CV boxplot (selected model per objective)
-        if cv_scores:
-            fig, ax = plt.subplots(figsize=(10, 6), frameon=False)
-            ax.boxplot(cv_scores)
-            ax.set_xticklabels(objective_names, rotation=45, ha='right')
-            ax.set_ylabel("R² Score")
-            ax.set_title("Cross-Validation Performance by Objective (Selected Model)")
-            ax.grid(True, linestyle='--', alpha=0.7)
-            plt.tight_layout()
-            st.pyplot(fig)
-
-        # Feature sensitivity plot (parameter-level)
-        if feature_importances:
-            fig, axes = plt.subplots(1, len(y_list), figsize=(15, 5), sharey=False, frameon=False)
-            if len(y_list) == 1:
-                axes = [axes]
-
-            for i, (ax, importances) in enumerate(zip(axes, feature_importances)):
-                importances = np.asarray(importances, dtype=float).reshape(-1)
-                if len(importances) != len(X.columns):
-                    importances = np.resize(importances, len(X.columns))
-                indices = np.argsort(importances)
-                sorted_importances = importances[indices]
-                sorted_names = [X.columns[j] for j in indices]
-
-                max_imp = float(np.max(sorted_importances)) if len(sorted_importances) else 0.0
-                colors = cm.RdYlGn_r(sorted_importances / max_imp if max_imp > 0 else 0)
-
-                y_pos = np.arange(len(indices))
-                ax.barh(y_pos, sorted_importances, color=colors)
-                ax.set_yticks(y_pos)
-                ax.set_yticklabels(sorted_names)
-                ax.set_title(f"Sensitivity - {objective_names[i]} ({chosen_model_kinds[i]})")
-                ax.grid(True, linestyle='--', alpha=0.7)
-
-            plt.tight_layout()
-            st.pyplot(fig)
-
-        # Store outputs
-        if store_in_session:
-            st.session_state['models'] = models
-            st.session_state['objective_uncertainties'] = objective_uncertainties
-            st.session_state['model_kinds'] = chosen_model_kinds
-            st.session_state['objective_model_kinds'] = chosen_model_kinds
-            st.session_state['objective_model_reports'] = per_objective_reports
-            st.session_state['plot_estimators'] = plot_estimators
-            st.session_state['models_signature'] = f"{data_signature}|alpha={ridge_alpha}|folds={cv_folds}|trees={rf_n_estimators}|cores={num_cores}|kinds={tuple(chosen_model_kinds)}"
-
-        # Quick prediction smoke test
-        if len(X) > 0:
-            sample = X.iloc[0].values
-            st.write("### Testing Model Predictions")
-            st.write(f"Sample input: {sample}")
-            for i, model in enumerate(models):
-                pred = float(np.asarray(model.predict([sample]))[0])
-                st.write(f"Objective {i + 1} ({objective_names[i]}) prediction: {pred:.2f}")
-
-        return models, X.columns, objective_names
-
-    except Exception as e:
-        st.error(f"Error in model training: {e}")
-        import traceback
-        st.code(traceback.format_exc())
-
-
-def evaluate_batch(batch_params, models, num_objectives, objective_uncertainties=None):
-    results = []
-
-    for params in batch_params:
-        params_array = np.array([params])
-
-        predictions = []
-        uncertainties = []
-
-        for obj_idx, model in enumerate(models):
-            # Prediction
+            chosen_alpha = None
             try:
-                pred_val = float(model.predict(params_array)[0])
+                ridge_step = final_ridge.named_steps.get("ridge", None)
+                if hasattr(ridge_step, "alpha_"):
+                    chosen_alpha = float(ridge_step.alpha_)
             except Exception:
-                pred_val = 0.0
+                pass
 
-            # Uncertainty: hybrid if available; fallback to constant list
-            if hasattr(model, "predict_uncertainty"):
-                try:
-                    unc_val = float(np.asarray(model.predict_uncertainty(params_array))[0])
-                except Exception:
-                    unc_val = 0.0
-            elif objective_uncertainties is not None and obj_idx < len(objective_uncertainties):
-                unc_val = float(objective_uncertainties[obj_idx])
+            surrogate = RidgeSurrogate(final_ridge, sigma_floor=sigma_floor, chosen_alpha=chosen_alpha)
+            models.append(surrogate)
+            plot_estimators.append(final_ridge)
+
+            # Sensitivity from polynomial ridge coefficients
+            sens = compute_param_sensitivity_from_poly_ridge(final_ridge, X.columns)
+            feature_importances.append(sens)
+
+        elif chosen == "Random Forest":
+            rf_params = (rf_info.get('params') or {})
+            final_rf = RandomForestRegressor(
+                n_estimators=int(rf_trees_final),
+                random_state=42,
+                n_jobs=int(n_jobs) if n_jobs is not None else None,
+                max_features=rf_params.get('max_features', 'sqrt'),
+                max_depth=rf_params.get('max_depth', None),
+                min_samples_leaf=int(rf_params.get('min_samples_leaf', DEFAULT_RF_MIN_SAMPLES_LEAF)),
+            )
+            final_rf.fit(X, y)
+
+            surrogate = RandomForestSurrogate(final_rf, sigma_floor=sigma_floor)
+            models.append(surrogate)
+            plot_estimators.append(final_rf)
+
+            # Parameter sensitivity from RF feature_importances_ (already parameter-level)
+            try:
+                feature_importances.append(np.asarray(final_rf.feature_importances_, dtype=float))
+            except Exception:
+                feature_importances.append(np.zeros(len(X.columns), dtype=float))
+
+        else:  # Hybrid
+            if ridge_mode == "auto" and override_norm not in ("hybrid",):
+                final_ridge = build_poly2_ridgecv(DEFAULT_RIDGE_ALPHAS)
+                ridge_auto = True
             else:
-                unc_val = 0.0
+                final_ridge = build_poly2_ridge(float(ridge_alpha))
+                ridge_auto = False
 
-            predictions.append(pred_val)
-            uncertainties.append(unc_val)
+            final_ridge.fit(X, y)
+            resid_all = y - final_ridge.predict(X)
 
-        # Ensure correct length
-        if len(predictions) != num_objectives:
-            if len(predictions) < num_objectives:
-                predictions = predictions + [0.0] * (num_objectives - len(predictions))
-            else:
-                predictions = predictions[:num_objectives]
+            hyb_params = (hybrid_info.get('params') or {})
+            final_rf = RandomForestRegressor(
+                n_estimators=int(rf_trees_final),
+                random_state=42,
+                n_jobs=int(n_jobs) if n_jobs is not None else None,
+                max_features=hyb_params.get('max_features', 'sqrt'),
+                max_depth=hyb_params.get('max_depth', None),
+                min_samples_leaf=int(hyb_params.get('min_samples_leaf', DEFAULT_RF_MIN_SAMPLES_LEAF)),
+            )
+            final_rf.fit(X, resid_all)
 
-        if len(uncertainties) != num_objectives:
-            if len(uncertainties) < num_objectives:
-                uncertainties = uncertainties + [0.0] * (num_objectives - len(uncertainties))
-            else:
-                uncertainties = uncertainties[:num_objectives]
+            surrogate = HybridSurrogate(final_ridge, final_rf, sigma_floor=sigma_floor)
+            surrogate.kind = "Hybrid"
+            models.append(surrogate)
 
-        rounded_fitness = [f"{float(fit_val):.2f}" for fit_val in predictions]
-        rounded_uncertainty = [f"{float(unc_val):.2f}" for unc_val in uncertainties]
+            # Provide a sklearn estimator for learning curves
+            plot_estimators.append(HybridEstimator(
+                ridge_alpha=float(ridge_alpha),
+                ridge_alphas=DEFAULT_RIDGE_ALPHAS,
+                ridge_auto=ridge_auto,
+                rf_n_estimators=int(rf_trees_final),
+                rf_min_samples_leaf=int(hyb_params.get('min_samples_leaf', DEFAULT_RF_MIN_SAMPLES_LEAF)),
+                rf_max_depth=hyb_params.get('max_depth', None),
+                rf_max_features=hyb_params.get('max_features', 'sqrt'),
+                n_jobs=int(n_jobs) if n_jobs is not None else None
+            ))
 
-        results.append({
-            'params': params,
-            'predictions': predictions,
-            'uncertainties': uncertainties,
-            'rounded_fitness': rounded_fitness,
-            'rounded_uncertainty': rounded_uncertainty
+            sens = compute_param_sensitivity_from_poly_ridge(final_ridge, X.columns)
+            feature_importances.append(sens)
+
+        # Build report for UI
+        per_objective_reports.append({
+            "Objective": obj_name,
+            "Selected model": chosen,
+            "Selection basis": selection_reason,
+            "Ridge CV NMAE": ridge_info["nmae"],
+            "RF CV NMAE": rf_info["nmae"],
+            "Hybrid CV NMAE": hybrid_info["nmae"],
+            "Ridge CV R2": ridge_info["r2"],
+            "RF CV R2": rf_info["r2"],
+            "Hybrid CV R2": hybrid_info["r2"],
+            "Selected CV MAE": chosen_info["mae"],
+            "Selected CV NMAE": chosen_info["nmae"],
+            "Selected CV R2": chosen_info["r2"],
+            "Uncertainty floor (CV resid std)": sigma_floor,
         })
 
+
+    return dict(models=models, plot_estimators=plot_estimators, cv_scores=cv_scores,
+                feature_importances=feature_importances, objective_uncertainties=objective_uncertainties,
+                model_kinds=chosen_model_kinds, reports=per_objective_reports,
+                param_names=list(X.columns), objective_names=objective_names,
+                sample=X.iloc[0].to_numpy(), training_data=df.copy())
+
+
+
+def validate_training_data(df, num_objectives):
+    if not 1 <= int(num_objectives) < len(df.columns):
+        raise ValueError('Keep at least one parameter column before the objective columns.')
+    if len(df) < 4:
+        raise ValueError('At least four complete training cases are required.')
+    if not df.columns.is_unique:
+        raise ValueError('Column names must be unique.')
+    try:
+        values = df.to_numpy(dtype=float)
+    except (TypeError, ValueError) as exc:
+        raise ValueError('All parameters and objectives must be numeric.') from exc
+    if not np.isfinite(values).all():
+        raise ValueError('Remove or correct missing and non-finite training values.')
+
+
+def training_signature(df, num_objectives, settings, overrides):
+    return (VERSION, compute_df_signature(df), int(num_objectives),
+            tuple(sorted(settings.items())), tuple(sorted(overrides.items())))
+
+
+def get_training_bundle(df, num_objectives, settings, overrides, slot):
+    """Session-local models: full data content and all training settings identify a fit."""
+    signature = training_signature(df, num_objectives, settings, overrides)
+    cached = st.session_state.get(slot)
+    if cached is None or cached['signature'] != signature:
+        bundle = train_models(df, num_objectives, objective_model_overrides=overrides, **settings)
+        bundle['signature'] = signature
+        bundle['learning_curves'] = None
+        st.session_state[slot] = bundle
+    return st.session_state[slot]
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def read_table(content, filename):
+    stream = BytesIO(content)
+    return pd.read_csv(stream) if filename.lower().endswith('.csv') else pd.read_excel(stream)
+
+
+def normalized_scores(values, weights, bounds=None):
+    """Higher is better for every direction. Zero weights exclude an objective."""
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    if values.ndim != 2 or values.shape[1] != len(weights):
+        raise ValueError('Objective count and weight count must match.')
+    if not np.isfinite(values).all() or not np.isfinite(weights).all():
+        raise ValueError('Objectives and weights must be finite.')
+    low, high = (values.min(axis=0), values.max(axis=0)) if bounds is None else bounds
+    span = np.asarray(high) - np.asarray(low)
+    scaled = np.divide(values - low, span, out=np.zeros_like(values), where=span > 0)
+    utility = np.where(weights < 0, 1.0 - scaled, scaled)
+    utility[:, span == 0] = 0.0  # Constant objectives cannot discriminate between solutions.
+    return utility @ np.abs(weights)
+
+
+def pareto_mask(values, weights):
+    """Exact dominance, preserving ties. Weight magnitude affects score, not membership."""
+    values = np.asarray(values, dtype=float)
+    weights = np.asarray(weights, dtype=float)
+    if values.ndim != 2 or values.shape[1] != len(weights):
+        raise ValueError('Objective count and weight count must match.')
+    if not np.isfinite(values).all() or not np.isfinite(weights).all():
+        raise ValueError('Cannot compute Pareto membership from non-finite values.')
+    active = weights != 0
+    if not active.any():
+        raise ValueError('Give at least one objective a nonzero weight.')
+    utility = values[:, active] * np.sign(weights[active])
+    keep = np.ones(len(values), dtype=bool)
+    for i in range(len(values)):
+        if keep[i]:
+            # Current surviving points worse in all objectives are dominated.
+            survivors = np.flatnonzero(keep)
+            dominated = (utility[survivors] <= utility[i]).all(axis=1) & (utility[survivors] < utility[i]).any(axis=1)
+            keep[survivors[dominated]] = False
+    return keep
+
+
+def parameter_grid(ranges):
+    axes = []
+    for name, (low, high, step) in ranges.items():
+        if not np.isfinite([low, high, step]).all() or low > high:
+            raise ValueError(f'{name}: use finite values and a minimum no greater than the maximum.')
+        if low == high:
+            axes.append(np.array([low]))
+        else:
+            if step <= 0:
+                raise ValueError(f'{name}: step must be positive.')
+            count = int(math.floor((high - low) / step + 1e-10)) + 1
+            axis = low + np.arange(count) * step
+            # Never generate a point beyond the entered maximum.
+            axes.append(np.minimum(axis, high))
+    return axes, math.prod(len(axis) for axis in axes)
+
+
+def evaluate_grid(bundle, ranges, weights, progress=None):
+    axes, total = parameter_grid(ranges)
+    if not any(weights):
+        raise ValueError('Give at least one objective a nonzero weight.')
+    iterator = product(*axes)
+    chunks = []
+    completed = 0
+    while batch := list(islice(iterator, 2048)):
+        x = np.asarray(batch, dtype=float)
+        predicted = np.column_stack([model.predict(x) for model in bundle['models']])
+        uncertainty = np.column_stack([model.predict_uncertainty(x) for model in bundle['models']])
+        if not np.isfinite(predicted).all() or not np.isfinite(uncertainty).all():
+            raise ValueError('Model produced invalid predictions; optimization was stopped.')
+        chunks.append(np.column_stack([x, predicted, uncertainty]))
+        completed += len(batch)
+        if progress:
+            progress(completed / total)
+    columns = bundle['param_names'] + bundle['objective_names'] + ['Uncertainty_' + o for o in bundle['objective_names']]
+    results = pd.DataFrame(np.vstack(chunks), columns=columns)
+    values = results[bundle['objective_names']].to_numpy()
+    results['Weighted Sum'] = normalized_scores(values, weights)
+    results['Pareto'] = pareto_mask(values, weights)
     return results
 
 
-def process_completed_results(async_results, hof, temp_results_file,
-                              processed_count, total_combinations,
-                              progress_bar, status_text, start_time):
-    """Process any completed async results"""
-    # Check which results are ready
-    completed_indices = []
-    for i, (future, batch_size) in enumerate(async_results):
-        if future.done():
-            completed_indices.append(i)
-
-            try:
-                # Get the result
-                result_batch = future.result()
-            except Exception as e:
-                st.error(f"Error in batch processing: {e}")
-                continue
-
-            # Process results and update Pareto front
-            with open(temp_results_file, 'a') as f:
-                for result in result_batch:
-                    # Create individual
-                    individual = creator.Individual(result['params'])
-                    individual.fitness.values = tuple(result['predictions'])
-                    individual.weighted_sum = 0.0  # to be calculated after normalization
-                    individual.uncertainty = tuple(result['uncertainties'])
-
-                    # Update Pareto front
-                    hof.update([individual])
-
-                    # Write to CSV directly to save memory
-                    row_data = [str(float(p)) for p in result['params']] + result['rounded_fitness'] + result[
-                        'rounded_uncertainty']
-                    f.write(','.join(row_data) + '\n')
-
-            # Update progress
-            processed_count += batch_size
-            progress = min(1.0, processed_count / total_combinations)
-            progress_bar.progress(progress)
-
-            elapsed_time = time.time() - start_time
-            estimated_total = elapsed_time / progress if progress > 0 else 0
-            remaining_time = estimated_total - elapsed_time
-
-            status_text.text(f"Processed {processed_count}/{total_combinations} combinations. " +
-                             f"Elapsed: {elapsed_time:.2f}s. Estimated remaining: {remaining_time:.2f}s.")
-
-    # Remove completed results
-    for i in sorted(completed_indices, reverse=True):
-        async_results.pop(i)
-
-    return processed_count
+def signed_sensitivity(bundle):
+    """Average model response across a feature's observed range (not causal importance)."""
+    if 'signed_sensitivity' in bundle:
+        return bundle['signed_sensitivity']
+    data = bundle['training_data']
+    names = bundle['param_names']
+    reference = data[names]
+    if len(reference) > 256:
+        reference = reference.sample(256, random_state=42)
+    x = reference.to_numpy(dtype=float)
+    effects = np.zeros((len(bundle['models']), len(names)))
+    changes = np.zeros_like(effects)
+    mixed = np.zeros_like(effects, dtype=bool)
+    for j, name in enumerate(names):
+        low, high = float(data[name].min()), float(data[name].max())
+        if low == high:
+            continue
+        blocks = []
+        levels = 9
+        for level in np.linspace(low, high, levels):
+            block = x.copy()
+            block[:, j] = level
+            blocks.append(block)
+        probe = np.vstack(blocks)
+        for i, (model, objective) in enumerate(zip(bundle['models'], bundle['objective_names'])):
+            predictions = np.asarray(model.predict(probe), dtype=float).reshape(levels, len(x))
+            if not np.isfinite(predictions).all():
+                raise ValueError(f'Invalid predictions while calculating sensitivity for {objective}.')
+            response = predictions.mean(axis=1)
+            delta = float(response[-1] - response[0])
+            span = float(data[objective].max() - data[objective].min())
+            changes[i, j] = delta
+            effects[i, j] = 100 * delta / span if span > 0 else 0.0
+            increments = np.diff(response)
+            tolerance = max(span * 1e-6, 1e-10)
+            mixed[i, j] = bool((increments > tolerance).any() and (increments < -tolerance).any())
+    result = dict(values=effects, changes=changes, mixed=mixed, reference_count=len(x))
+    bundle['signed_sensitivity'] = result
+    return result
 
 
-# Function to perform streaming optimization with optimized parallel processing
-@st.cache_resource
-def optimize_parameters_parallel(param_ranges, num_objectives, _models, weights, output_path, objective_names, objective_uncertainties=None, models_signature: str = "", num_cores: int = 1):
-    try:
-        st.write("Starting optimization process with streaming parallel processing...")
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-
-        start_time = time.time()
-
-        hof = tools.ParetoFront()
-
-        # Get parameter combinations generator and total count
-        param_generator, total_combinations = parameter_combinations_generator(param_ranges)
-
-        st.write(f"Total parameter combinations to evaluate: {total_combinations}")
-
-        # Threads for parallel evaluation (caps to available CPU cores)
-        requested_cores = int(num_cores) if num_cores is not None else int(st.session_state.get('num_cores', 8))
-        available_cores = os.cpu_count() or requested_cores
-        num_cores = max(1, min(requested_cores, available_cores))
-        st.write(f"Using {num_cores} threads for processing (requested: {requested_cores}, available: {available_cores})")
-
-        # Calculate optimal batch size for Streamlit Cloud (smaller batches for stability)
-        if total_combinations < 1000:
-            batch_size = max(1, min(250, total_combinations // 10))
-        elif total_combinations < 10000:
-            batch_size = max(5, min(500, total_combinations // 20))
-        else:
-            batch_size = max(10, min(1000, total_combinations // 50))  # Much smaller batches for large datasets
-
-        st.write(f"Using adaptive batch size: {batch_size}")
-
-        # Prepare for streaming processing
-        processed_count = 0
-        batch_count = 0
-
-        # Prepare column labels for the DataFrame
-        param_labels = list(param_ranges.keys())
-        fitness_labels = list(objective_names)
-        uncertainty_labels = [f'Uncertainty_{name}' for name in objective_names]
-
-        # Create DataFrame for results with chunked writing
-        df_columns = param_labels + fitness_labels + uncertainty_labels
-
-        # Create a temporary file for results
-        temp_results_file = "temp_results.csv"
-        with open(temp_results_file, 'w') as f:
-            # Write header
-            f.write(','.join(df_columns) + '\n')
-
-        # Create a pool of worker threads (more Streamlit-friendly than processes)
-        with ThreadPoolExecutor(max_workers=num_cores) as executor:
-            # Use a queue of async results to maximize CPU utilization
-            async_results = []
-            batches = []
-            current_batch = []
-
-            # Process parameter combinations in streaming batches
-            for i, params in enumerate(param_generator):
-                current_batch.append(params)
-
-                # When batch is full, submit it asynchronously
-                if len(current_batch) >= batch_size:
-                    batch_count += 1
-                    batches.append(current_batch)
-
-                    # Submit batch for async processing
-                    future = executor.submit(evaluate_batch, current_batch, _models, num_objectives, objective_uncertainties)
-                    async_results.append((future, len(current_batch)))
-
-                    # Reset current batch
-                    current_batch = []
-
-                # Process completed results to free up memory
-                processed_count = process_completed_results(
-                    async_results, hof, temp_results_file,
-                    processed_count, total_combinations,
-                    progress_bar, status_text, start_time
-                )
-
-                # Periodic memory cleanup and progress check
-                if i % 100 == 0:
-                    import gc
-                    gc.collect()
-            # Submit any remaining combinations
-            if current_batch:
-                batch_count += 1
-                batches.append(current_batch)
-
-                # Submit batch for async processing
-                future = executor.submit(evaluate_batch, current_batch, _models, num_objectives, objective_uncertainties)
-                async_results.append((future, len(current_batch)))
-
-            # Wait for all remaining results to complete
-            while async_results:
-                processed_count = process_completed_results(
-                    async_results, hof, temp_results_file,
-                    processed_count, total_combinations,
-                    progress_bar, status_text, start_time
-                )
-                time.sleep(0.1)  # Short sleep to prevent CPU spinning
-
-        # Complete progress bar
-        progress_bar.progress(1.0)
-
-        # Read results from temporary file
-        results_df = pd.read_csv(temp_results_file, encoding='latin-1')
-
-        # Calculate weighted sum for each solution
-        if 'Weighted Sum' not in results_df.columns:
-            # Normalize and calculate weighted sum
-            weighted_sum = np.zeros(len(results_df))
-            for i, (obj, w) in enumerate(zip(fitness_labels, weights)):
-                col_values = results_df[obj].astype(float)
-                v_min = col_values.min()
-                v_max = col_values.max()
-
-                if v_max == v_min:
-                    normalized = np.zeros_like(col_values)
-                elif w < 0:
-                    normalized = w * (v_max - col_values) / (v_max - v_min)
-                else:
-                    normalized = w * (col_values - v_min) / (v_max - v_min)
-
-                weighted_sum += normalized
-
-            results_df['Weighted Sum'] = weighted_sum
-            for ind, wsum in zip(hof, weighted_sum):
-                ind.weighted_sum = wsum
-
-        # Save results to Excel file if not too large
-        try:
-            if len(results_df) <= 1048576:  # Excel row limit
-                results_df.to_excel(output_path, index=False)
-                st.success(f"Results saved to {output_path}")
-                # Store the output path in session state for later use
-                st.session_state['output_path'] = output_path
-            else:
-                csv_path = output_path.replace('.xlsx', '.csv')
-                results_df.to_csv(csv_path, index=False)
-                st.warning(f"Results too large for Excel. Saved to {csv_path} instead.")
-                # Store the CSV path in session state for later use
-                st.session_state['output_path'] = csv_path
-        except Exception as e:
-            st.error(f"Error saving results: {e}")
-            # Fallback to CSV
-            try:
-                csv_path = output_path.replace('.xlsx', '.csv')
-                results_df.to_csv(csv_path, index=False)
-                st.success(f"Results saved to {csv_path}")
-                # Store the CSV path in session state for later use
-                st.session_state['output_path'] = csv_path
-            except:
-                st.error("Failed to save results to file.")
-
-        # Clean up temporary file
-        try:
-            os.remove(temp_results_file)
-        except:
-            pass
-
-        # Display optimization summary
-        st.write(f"Optimization completed in {time.time() - start_time:.2f} seconds")
-        st.write(f"Evaluated {processed_count} parameter combinations")
-        st.write(f"Found {len(hof)} solutions on the Pareto front")
-
-        return hof
-
-    except Exception as e:
-        st.error(f"Error in optimization: {e}")
-        import traceback
-        st.code(traceback.format_exc())
-        return None
+def sensitivity_figure(bundle):
+    stats = signed_sensitivity(bundle)
+    objectives = bundle['objective_names']
+    fig = make_subplots(rows=1, cols=len(objectives), horizontal_spacing=min(0.2, 0.4 / len(objectives)),
+                        subplot_titles=[f'{name} ({kind})' for name, kind in zip(objectives, bundle['model_kinds'])])
+    for i, values in enumerate(stats['values']):
+        order = np.argsort(values)
+        limit = max(float(np.max(np.abs(values))), 1.0)
+        labels = [bundle['param_names'][j] + (' *' if stats['mixed'][i, j] else '') for j in order]
+        fig.add_trace(go.Bar(x=values[order], y=labels, orientation='h', showlegend=False,
+            customdata=np.column_stack([stats['changes'][i, order], stats['mixed'][i, order]]),
+            marker=dict(color=values[order], colorscale=SCORE_COLORS, cmin=-limit, cmax=limit,
+                        line=dict(color='#777777', width=0.4)),
+            hovertemplate='%{y}<br>Net sensitivity: %{x:.2f}% of objective range<br>Change in objective units: %{customdata[0]:.3f}<extra></extra>'),
+            row=1, col=i + 1)
+        fig.update_xaxes(range=[-limit * 1.15, limit * 1.15], zeroline=True,
+                         zerolinewidth=2, zerolinecolor='#666666', title_text='Net sensitivity (% of objective range)', row=1, col=i + 1)
+        fig.update_yaxes(automargin=True, row=1, col=i + 1)
+    fig.update_layout(template='plotly_white', height=max(380, 30 * len(bundle['param_names']) + 150),
+                      margin=dict(l=20, r=20, b=60, t=65))
+    return fig
 
 
-# Helper function to normalize weighted sum consistently
-def normalize_weighted_sum(objective_values, weights):
-    """Calculate normalized weighted sum for given objective values and weights"""
-    weighted_sum = 0.0
-
-    for i, (obj_vals, w) in enumerate(zip(objective_values.T, weights)):
-        v_min = obj_vals.min()
-        v_max = obj_vals.max()
-
-        if v_max == v_min:
-            normalized = np.zeros_like(obj_vals)
-        elif w < 0:
-            normalized = w * (v_max - obj_vals) / (v_max - v_min)
-        else:
-            normalized = w * (obj_vals - v_min) / (v_max - v_min)
-
-        weighted_sum += normalized
-
-    return weighted_sum
+def render_sensitivity(bundle, key):
+    st.subheader('Sensitivity Analysis')
+    st.plotly_chart(sensitivity_figure(bundle), use_container_width=True, key=key)
+    st.caption('Negative/red = inverse response; positive/green = direct response; zero/yellow = no net change. '
+               'Bars show the mean predicted change from each parameter’s observed minimum to maximum, '
+               'as a percentage of the observed objective range. Colors indicate direction, not desirability.')
+    st.caption('* Direction reverses along the sampled response curve; a small net bar can hide a strong nonlinear response. '
+               'Other inputs are held at their reference-case values (up to 256 cases). Constant parameters have zero sensitivity. '
+               'These model-based effects are not causal and can include unobserved combinations of correlated inputs.')
 
 
-# Helper function to create dimension for parallel coordinates plot with non-overlapping tick labels
-def create_dimension(label, values, min_val, max_val):
-    """Create a dimension for parallel coordinates with clean tick labels"""
-    # Let Plotly handle tick positioning automatically for better readability
-    # Only specify range and let Plotly determine optimal tick positions
-    if min_val == max_val:
-        # Handle edge case where all values are the same
-        return dict(
-            range=[min_val - 0.1, max_val + 0.1],
-            label=label,
-            values=values
-        )
+def accuracy_splits(data, params, mode, folds, repeats, parameter=None, groups=None):
+    """Outer tests never share cases (or identical input combinations) with training."""
+    if mode == 'Unseen parameter levels':
+        labels = data[parameter].to_numpy()
+        levels = np.unique(labels)
+        if not 2 <= len(levels) <= 20:
+            raise ValueError('Choose a parameter with 2–20 distinct levels.')
+        splits = []
+        for level in levels:
+            test = np.flatnonzero(labels == level)
+            kind = 'boundary extrapolation' if level in (levels[0], levels[-1]) else 'interior interpolation'
+            splits.append((1, f'{parameter}={level:g} ({kind})', np.flatnonzero(labels != level), test))
     else:
-        return dict(
-            range=[min_val, max_val],
-            label=label,
-            values=values
-        )
-
-
-# Visualize Pareto front using Plotly for interactivity
-def visualize_pareto_front(hof, objective_names_list, param_names_list, weights):
-    try:
-        # Ensure objective_names_list and param_names_list are lists
-        objective_names_list = list(objective_names_list)
-        param_names_list = list(param_names_list)
-
-        # Extract objective values for all solutions
-        objective_values = np.array([list(ind.fitness.values) for ind in hof])
-
-        # Calculate weighted sum for each solution
-        weighted_sums = np.array([ind.weighted_sum for ind in hof])
-
-        # Create a DataFrame for the parallel coordinates plot
-        data = []
-        for i, ind in enumerate(hof):
-            solution_data = {}
-            # Add parameter values
-            for j, param_name in enumerate(param_names_list):
-                solution_data[param_name] = float(ind[j])
-
-            # Add objective values
-            for j, obj_name in enumerate(objective_names_list):
-                solution_data[obj_name] = float(ind.fitness.values[j])
-
-            # Add weighted sum and solution ID
-            solution_data['Weighted Sum'] = float(weighted_sums[i])
-            solution_data['Solution ID'] = i
-
-            data.append(solution_data)
-
-        df = pd.DataFrame(data)
-
-        # Create parallel coordinates plot with Plotly
-        dimensions = []
-
-        # Add parameter dimensions with non-overlapping tick labels
-        for param in param_names_list:
-            param_min = df[param].min()
-            param_max = df[param].max()
-            dimensions.append(create_dimension(param, df[param], param_min, param_max))
-
-        # Add objective dimensions with non-overlapping tick labels
-        for obj in objective_names_list:
-            obj_min = df[obj].min()
-            obj_max = df[obj].max()
-            dimensions.append(create_dimension(obj, df[obj], obj_min, obj_max))
-
-        # Add weighted sum dimension at the far right
-        ws_min = df['Weighted Sum'].min()
-        ws_max = df['Weighted Sum'].max()
-        dimensions.append(create_dimension('Weighted Sum', df['Weighted Sum'], ws_min, ws_max))
-
-        # Create the parallel coordinates plot
-        with st.expander("Optimization Result (Pareto Front)", expanded=False):
-            st.write("## Solutions in Pareto Front")
-            st.write("Here you find the non-dominated solutions in Pareto Front")
-            fig = go.Figure(data=
-            go.Parcoords(
-                line=dict(
-                    color=df['Weighted Sum'],
-                    colorscale='Tealrose',
-                    showscale=True,
-                    colorbar=dict(title='Weighted Sum', nticks=11)
-                ),
-                dimensions=dimensions,
-                unselected=dict(line=dict(opacity=0)),
-                rangefont=dict(family="Arial", size=14),
-                tickfont=dict(family="Arial", size=11, weight="bold", color="black"),
-
-            )
-            )
-
-            fig.update_layout(
-                title="Solutions in Pareto Front",
-                height=600,
-                margin=dict(l=50, r=50, t=100, b=50),  # Increased left and right margins for axis labels
-                font=dict(family='Arial', size=14)  # Reduced font size to prevent overlapping
-            )
-
-            # Display the interactive plot
-            st.plotly_chart(fig, use_container_width=True)
-
-    except Exception as e:
-        st.error(f"Error visualizing Pareto front: {e}")
-        import traceback
-        st.code(traceback.format_exc())
-
-
-# Visualize a single selected solution
-def visualize_selected_solution(solution, param_names, objective_names, weights, hof):
-    try:
-        st.write("## Interactive Solution Explorer")
-        st.write("Here you can isolate and investigate a specific non-dominated solutions from Pareto Front")
-        st.subheader("Selected Solution Details")
-
-        # Ensure param_names and objective_names are lists
-        param_names = list(param_names)
-        objective_names = list(objective_names)
-
-        # Create tables for parameter and objective values (formatted to exactly 2 decimal places)
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.write("Parameter Values")
-            param_df = pd.DataFrame({
-                'Parameter': param_names,
-                'Value': [f"{float(p):.2f}" for p in solution]  # Format to exactly 2 decimal places
-            })
-            st.table(param_df)
-
-        with col2:
-            st.write("Objective Values")
-            obj_df = pd.DataFrame({
-                'Objective': objective_names,
-                'Value': [f"{float(f):.2f}" for f in solution.fitness.values],  # Format to exactly 2 decimal places
-                '(±)': [f"{float(u):.2f}" for u in solution.uncertainty],
-                # Format to exactly 2 decimal places
-                'Weight': [f"{float(w):.2f}" for w in weights]  # Format to exactly 2 decimal places
-            })
-            st.table(obj_df)
-
-        # Create the parallel coordinates plot for the selected solution using Plotly for consistency
-        # Combine parameter values and objective values for visualization
-        all_names = param_names + objective_names
-
-        # Extract all data for all solutions (parameters + objectives)
-        all_data = []
-        for ind in hof:
-            solution_data = {}
-            # Add parameter values
-            for j, param_name in enumerate(param_names):
-                solution_data[param_name] = float(ind[j])
-
-            # Add objective values
-            for j, obj_name in enumerate(objective_names):
-                solution_data[obj_name] = float(ind.fitness.values[j])
-
-            # Add solution ID
-            solution_data['is_selected'] = 0  # Not selected
-
-            all_data.append(solution_data)
-
-        # Add selected solution data
-        selected_data = {}
-        # Add parameter values
-        for j, param_name in enumerate(param_names):
-            selected_data[param_name] = float(solution[j])
-
-        # Add objective values
-        for j, obj_name in enumerate(objective_names):
-            selected_data[obj_name] = float(solution.fitness.values[j])
-
-        # Mark as selected
-        selected_data['is_selected'] = 1  # Selected
-
-        # Create DataFrame with all solutions
-        df_all = pd.DataFrame(all_data)
-        df_selected = pd.DataFrame([selected_data])
-
-        # Combine all data
-        df_combined = pd.concat([df_all, df_selected])
-
-        # Create dimensions for parallel coordinates with non-overlapping tick labels
-        dimensions = []
-        for name in all_names:
-            name_min = df_combined[name].min()
-            name_max = df_combined[name].max()
-            dimensions.append(create_dimension(name, df_combined[name], name_min, name_max))
-
-        # Create figure
-        fig = go.Figure(data=
-        go.Parcoords(
-            line=dict(
-                color=df_combined['is_selected'],
-                colorscale=[[0, 'rgba(250,250,250,0.5)'], [1, 'rgba(255,0,0,1)']],
-                showscale=False
-            ),
-            dimensions=dimensions,
-            unselected=dict(line=dict(opacity=0)),
-            rangefont=dict(family="Arial", size=14),
-            tickfont=dict(family="Arial", size=12, weight="bold", color="black")
-        )
-        )
-
-        fig.update_layout(
-            title="Selected Solution",
-            height=600,
-            margin=dict(l=50, r=50, t=100, b=50),  # Increased margins for labels
-            font=dict(family="Arial", size=14)  # Smaller font to prevent overlap
-        )
-
-        st.plotly_chart(fig, use_container_width=True)
-
-    except Exception as e:
-        st.error(f"Error visualizing selected solution: {e}")
-        import traceback
-        st.code(traceback.format_exc())
-
-
-# Visualize parameter trends
-def visualize_parameter_trends(hof, param_names, objective_names):
-    with st.expander("Trend Analysis", expanded=False):
-        try:
-            st.write("## Trend Analysis")
-            st.write("Here you can investigate how each parameter affects objectives")
-            # Ensure param_names and objective_names are lists
-            param_names = list(param_names)
-            objective_names = list(objective_names)
-
-            # Extract data for all solutions
-            param_data = np.zeros((len(hof), len(param_names)))
-            objective_data = np.zeros((len(hof), len(objective_names)))
-
-            for i, ind in enumerate(hof):
-                # Add parameter values
-                for j, param in enumerate(ind):
-                    param_data[i, j] = float(param)
-
-                # Add objective values
-                for j, obj in enumerate(ind.fitness.values):
-                    objective_data[i, j] = float(obj)
-
-            # Create a trend diagram for each parameter
-            for p_idx, param_name in enumerate(param_names):
-                st.subheader(f"Parameter: {param_name}")
-
-                # Create a figure with subplots for each objective (without frame)
-                fig, axes = plt.subplots(1, len(objective_names), figsize=(15, 4), frameon=False)
-                if len(objective_names) == 1:
-                    axes = [axes]
-
-                for o_idx, (obj_name, ax) in enumerate(zip(objective_names, axes)):
-                    # Extract parameter and objective values
-                    x = param_data[:, p_idx]
-                    y = objective_data[:, o_idx]
-
-                    # Plot scatter points
-                    ax.scatter(x, y, alpha=0.5, color='green')
-
-                    # Add trendline if there are enough points
-                    if len(x) > 1:
-                        try:
-                            # Fit a polynomial of degree 1 (linear) or 2 (quadratic) based on data size
-                            degree = 2 if len(x) > 5 else 1
-                            z = np.polyfit(x, y, degree)
-                            p = np.poly1d(z)
-
-                            # Generate x values for the trendline
-                            x_trend = np.linspace(min(x), max(x), 100)
-
-                            # Plot the trendline
-                            ax.plot(x_trend, p(x_trend), "r--")
-                        except:
-                            # If fitting fails, skip trendline
-                            pass
-
-                    ax.set_xlabel(param_name)
-                    ax.set_ylabel(obj_name)
-                    ax.set_title(f"{param_name} vs {obj_name}")
-                    ax.grid(True, linestyle='--', alpha=0.7)
-
-                plt.tight_layout()
-                st.pyplot(fig)
-
-        except Exception as e:
-            st.error(f"Error visualizing parameter trends: {e}")
-            import traceback
-            st.code(traceback.format_exc())
-
-
-# Initialize session state variables
-def initialize_session_state():
-    if 'models' not in st.session_state:
-        st.session_state['models'] = []
-
-    if 'optimization_complete' not in st.session_state:
-        st.session_state['optimization_complete'] = False
-
-    if 'hof' not in st.session_state:
-        st.session_state['hof'] = None
-
-    if 'param_names' not in st.session_state:
-        st.session_state['param_names'] = []
-
-    if 'objective_names' not in st.session_state:
-        st.session_state['objective_names'] = []
-
-    if 'weights' not in st.session_state:
-        st.session_state['weights'] = []
-
-    if 'selected_solution_index' not in st.session_state:
-        st.session_state['selected_solution_index'] = 0
-
-    if 'active_tab' not in st.session_state:
-        st.session_state['active_tab'] = "Training"
-
-    if 'num_cores' not in st.session_state:
-        st.session_state['num_cores'] = 8
-
-    if 'output_path' not in st.session_state:
-        st.session_state['output_path'] = "evaluated_solutions.xlsx"
-
-
-# Callback for solution selection
-def on_solution_select():
-    # This function will be called when a solution is selected
-    # Get the key that triggered the callback
-    for key in st.session_state:
-        if key.startswith('solution_selector_') and st.session_state[key] != st.session_state.get(
-                'selected_solution_index', 0):
-            st.session_state['selected_solution_index'] = st.session_state[key]
-            break
-
-
-# Function to display optimization results in a separate mode
-def display_optimization_results():
-    st.title("Optimization Results Explorer")
-    st.write("Explore optimization results")
-
-    # Get data from session state
-    hof = st.session_state['hof']
-    param_names_list = st.session_state['param_names']
-    objective_names_list = st.session_state['objective_names']
-    weights = st.session_state['weights']
-    if not hof:
-        st.error("No optimization results found.")
-        return
-
-    # Display Pareto front visualization
-    visualize_pareto_front(hof, objective_names_list, param_names_list, weights)
-
-    # Display Parameter Trend Analysis (only once)
-    visualize_parameter_trends(hof, param_names_list, objective_names_list)
-
-    # Recalculate normalized weighted sum for consistent display
-    objective_values = np.array([list(ind.fitness.values) for ind in hof])
-    normalized_weighted_sums = normalize_weighted_sum(objective_values, weights)
-
-    # Update the weighted sum in each individual
-    for ind, norm_wsum in zip(hof, normalized_weighted_sums):
-        ind.weighted_sum = norm_wsum
-
-    # Sort solutions by normalized weighted sum (lowest to highest)
-    sorted_solutions = sorted(range(len(hof)), key=lambda i: hof[i].weighted_sum, reverse=False)
-
-    # Create a mapping from sorted index to original index
-    sorted_to_original = {i: sorted_idx for i, sorted_idx in enumerate(sorted_solutions)}
-    st.session_state['sorted_to_original'] = sorted_to_original
-
-    # Interactive solution explorer
-    with st.expander("Interactive Solution Explorer", expanded=False):
-        st.write("Here you can isolate and investigate a specific non-dominated solutions from Pareto Front")
-
-        # Create a unique key for the solution selector to avoid duplicate key errors
-        # Use a timestamp to ensure uniqueness across reruns
-        if 'explorer_key_suffix' not in st.session_state:
-            st.session_state['explorer_key_suffix'] = str(int(time.time()))
-
-        unique_selector_key = f"solution_selector_{st.session_state['explorer_key_suffix']}"
-
-        # Create selectbox with sorted solutions using callback
-        selected_solution_sorted = st.selectbox(
-            "Select solution to explore:",
-            options=range(len(sorted_solutions)),
-            format_func=lambda i: f"Solution {i + 1} (Weighted Sum: {hof[sorted_to_original[i]].weighted_sum:.2f})",
-            key=unique_selector_key,
-            index=st.session_state['selected_solution_index'],
-            on_change=on_solution_select
-        )
-
-        # Get the original index
-        selected_solution_original = sorted_to_original[selected_solution_sorted]
-
-        # Visualize the selected solution
-        solution = hof[selected_solution_original]
-        visualize_selected_solution(solution, param_names_list, objective_names_list, weights, hof)
-
-    # === NEW TAB: Estimate Objectives for Custom Parameter Combination ===
-    with st.expander("Estimate Objectives Results for Custom Parameters Values", expanded=False):
-        st.write("## Estimate Objectives Results for Custom Parameters Values")
-        st.write(
-            "Here you can estimate what is expected to be the result for each individual objective for entered parameter values")
-        st.write("### Enter parameter values to simulate:")
-
-        input_values = {}
-        col1, col2, col3 = st.columns(3)
-        for i, param in enumerate(param_names_list):
-            col = [col1, col2, col3][i % 3]
-            with col:
-                input_values[param] = st.number_input(f"{param}", key=f"custom_input_{i}")
-
-        input_array = np.array([[input_values[p] for p in param_names_list]])
-
-        if st.button("Estimate Objectives Results"):
-            models = st.session_state.get("models", [])
-            if not models:
-                st.error("No trained models found.")
+        if mode == 'Unseen buildings' and groups is None:
+            raise ValueError('Building labels are required for an unseen-building audit.')
+        labels = (np.asarray(groups) if mode == 'Unseen buildings' else
+                  pd.util.hash_pandas_object(data[params], index=False).to_numpy())
+        if len(labels) != len(data) or pd.isna(labels).any():
+            raise ValueError('Supply one nonempty building label for every training row, in the same order.')
+        codes, unique = pd.factorize(labels)
+        if len(unique) < folds:
+            raise ValueError(f'Need at least {folds} distinct buildings or input combinations.')
+        splits = []
+        for repeat in range(1, repeats + 1):
+            for fold, (tr, te) in enumerate(KFold(folds, shuffle=True, random_state=41 + repeat).split(unique), 1):
+                splits.append((repeat, f'Fold {fold}', np.flatnonzero(np.isin(codes, tr)), np.flatnonzero(np.isin(codes, te))))
+    if any(len(tr) < 8 or len(te) < 1 for _, _, tr, te in splits):
+        raise ValueError('Every audit split needs at least 8 training cases and 1 test case. Add data or adjust the audit.')
+    return splits
+
+
+def run_accuracy_audit(data, num_objectives, settings, overrides, mode, folds=5,
+                       repeats=1, parameter=None, groups=None, progress=None):
+    params, objectives = list(data.columns[:-num_objectives]), list(data.columns[-num_objectives:])
+    splits = accuracy_splits(data, params, mode, folds, repeats, parameter, groups)
+    rows = []
+    for step, (repeat, split, tr, te) in enumerate(splits, 1):
+        training = data.iloc[tr].reset_index(drop=True)
+        fitted = train_models(training, num_objectives, objective_model_overrides=overrides, **settings)
+        x = data.iloc[te][params]
+        for obj, model, kind in zip(objectives, fitted['models'], fitted['model_kinds']):
+            predicted = np.asarray(model.predict(x), dtype=float)
+            if not np.isfinite(predicted).all():
+                raise ValueError(f'Non-finite audit predictions for {obj}.')
+            for pos, index in enumerate(te):
+                actual = float(data.iloc[index][obj])
+                rows.append({'Repeat': repeat, 'Split': split, 'Data row': int(index) + 1,
+                    'Objective': obj, 'Actual': actual, 'Prediction': float(predicted[pos]),
+                    'Error': float(predicted[pos]) - actual,
+                    'Absolute error': abs(float(predicted[pos]) - actual),
+                    'Baseline prediction': float(training[obj].mean()), 'Selected model': kind,
+                    **{f'Input: {p}': data.iloc[index][p] for p in params}})
+        if progress:
+            progress(step / len(splits), f'Completed audit split {step} of {len(splits)}')
+    return pd.DataFrame(rows)
+
+
+def audit_metrics(predictions, tolerances, by_split=False):
+    records = []
+    keys = ['Objective', 'Repeat'] + (['Split'] if by_split else [])
+    for group, frame in predictions.groupby(keys, sort=False):
+        y, pred = frame['Actual'].to_numpy(), frame['Prediction'].to_numpy()
+        error = pred - y
+        absolute = np.abs(error)
+        obj = group[0]
+        records.append({**dict(zip(keys, group)), 'Test cases': len(y),
+            'MAE': absolute.mean(), 'RMSE': np.sqrt(np.mean(error ** 2)),
+            'R²': r2_score(y, pred) if len(y) > 1 and np.ptp(y) > 0 else np.nan,
+            'Bias': error.mean(), '90th percentile absolute error': np.quantile(absolute, .9),
+            'Maximum absolute error': absolute.max(), 'Tolerance (±)': tolerances[obj],
+            'Within tolerance (%)': 100 * np.mean(absolute <= tolerances[obj]),
+            'Training-mean baseline MAE': np.mean(np.abs(y - frame['Baseline prediction'].to_numpy()))})
+    return pd.DataFrame(records)
+
+
+def render_accuracy_audit(data, num_objectives, settings, overrides, key):
+    import json
+    import zipfile
+    params, objectives = list(data.columns[:-num_objectives]), list(data.columns[-num_objectives:])
+    signature = training_signature(data, num_objectives, settings, overrides)
+    st.caption('On-demand nested validation: each test case is excluded from training and model selection. '
+               'Uses the current model settings; it does not replace your trained models. '
+               'This measures agreement with the supplied data, not real-building accuracy.')
+    mode = st.selectbox('Accuracy test', ['Held-out combinations', 'Unseen parameter levels', 'Unseen buildings'], key=key + '_mode')
+    groups = None
+    if mode == 'Unseen buildings':
+        st.caption('Upload a one-column CSV with a header and one building ID per training row, in exactly the same order. '
+                   'IDs are used only for splitting, never as model inputs. All rows of a building stay together in the outer test.')
+        upload = st.file_uploader('Building labels CSV', type=['csv'], key=key + '_groups')
+        if upload is not None:
+            labels = pd.read_csv(upload)
+            if labels.shape[1] == 1 and len(labels) == len(data) and not labels.isna().any().any():
+                groups = labels.iloc[:, 0].astype(str).tolist()
             else:
-                st.subheader("Estimated Objective Values")
-                preds = [model.predict(input_array)[0] for model in models]
-                df_estimates = pd.DataFrame({
-                    "Objective": objective_names_list,
-                    "Estimated Value": [f"{p:.2f}" for p in preds]
-                })
-
-                # Create diagrams for each objective with color scale
-                for i, (obj, pred) in enumerate(zip(objective_names_list, preds)):
-                    obj_values = [float(ind.fitness.values[i]) for ind in hof]
-                    obj_min, obj_max = min(obj_values), max(obj_values)
-                    color_value = (pred - obj_min) / (obj_max - obj_min) if obj_max > obj_min else 0.5
-
-                all_pred_values = []
-                all_obj_names = []
-                all_obj_min = []
-                all_obj_max = []
-                all_normalized_values = []
-                all_percentiles = []
-                all_percentiles = []
-
-                # Collect values from the loop and normalize each objective individually
-                for i, (obj, pred) in enumerate(zip(objective_names_list, preds)):
-                    obj_values = [float(ind.fitness.values[i]) for ind in hof]
-                    obj_min, obj_max = min(obj_values), max(obj_values)
-
-                    # Normalize the prediction value to 0-100 scale for this specific objective
-                    if obj_max > obj_min:
-                        normalized_pred = ((float(pred) - obj_min) / (obj_max - obj_min)) * 100
-                    else:
-                        normalized_pred = 50  # If min == max, put it in the middle
-
-                    all_pred_values.append(float(pred))  # Keep original values for hover/display
-                    all_obj_names.append(str(obj))
-                    all_obj_min.append(obj_min)
-                    all_obj_max.append(obj_max)
-                    try:
-                        _vals = np.asarray(obj_values, dtype=float)
-                        percentile = float(np.mean(_vals <= float(pred)) * 100.0) if len(_vals) else 50.0
-                    except Exception:
-                        percentile = 50.0
-                    all_normalized_values.append(normalized_pred)
-                    all_percentiles.append(percentile)
-
-                # CLOSE THE POLYGON: Add the first point at the end
-                all_normalized_values_closed = all_normalized_values + [all_normalized_values[0]]
-                all_obj_names_closed = all_obj_names + [all_obj_names[0]]
-                all_pred_values_closed = all_pred_values + [all_pred_values[0]]
-                all_obj_min_closed = all_obj_min + [all_obj_min[0]]
-                all_obj_max_closed = all_obj_max + [all_obj_max[0]]
-
-                # Create single radar chart with individual axis scaling and closed polygon
-
-                fig = go.Figure()
-
-                fig.add_trace(go.Scatterpolar(
-                    r=all_normalized_values_closed,  # Use closed data
-                    theta=all_obj_names_closed,  # Use closed data
-                    fill='toself',
-                    fillcolor='rgba(154, 205, 50, 0.3)',  # yellowgreen with transparency
-                    line=dict(color='yellowgreen', width=4),
-                    marker=dict(size=8, color='yellowgreen'),
-                    name='Predictions',
-                    text=[f'{obj}: {val:.2f}<br>Range: {min_val:.2f} - {max_val:.2f}'
-                          for obj, val, min_val, max_val in
-                          zip(all_obj_names_closed, all_pred_values_closed, all_obj_min_closed, all_obj_max_closed)],
-                    hovertemplate='%{text}<br>Normalized: %{r:.1f}%<extra></extra>'
-                ))
-
-                fig.update_layout(
-                    polar=dict(
-                        radialaxis=dict(
-                            visible=True,
-                            range=[0, 100],  # Fixed 0-100 scale since we normalized the values
-                            ticksuffix='%',
-                            gridcolor='lightslategrey',
-                            tickmode='linear',
-                            tick0=0,
-                            dtick=20  # Show ticks every 20%
-                        ),
-                        angularaxis=dict(
-                            gridcolor='lightslategrey'
-                        )
-                    ),
-                    height=500,
-                    margin=dict(t=50, b=50),
-                    showlegend=False,
-                )
-
-                st.plotly_chart(fig, use_container_width=True)
-
-                # Display the values in a table for reference with individual scales (use original data, not closed)
-                df_estimates_detailed = pd.DataFrame({
-                    "Objective": all_obj_names,  # Use original data for table
-                    "Estimated Value": [f"{p:.2f}" for p in all_pred_values],
-                    "Min Range": [f"{m:.2f}" for m in all_obj_min],
-                    "Max Range": [f"{m:.2f}" for m in all_obj_max],
-                    "Normalized (%)": [f"{n:.1f}%" for n in all_normalized_values],
-                    "Percentile": [f"{p:.1f}%" for p in all_percentiles],
-                })
-                st.table(df_estimates_detailed)
-
-    # === NEW TAB: All Computed Solutions ===
-    with st.expander("All Computed Solutions (Interactive)", expanded=False):
-        st.write("## All Computed Solutions (Interactive)")
-        st.write(
-            "Here you can filter solutions by parameter and|or objective values range for a deeper investigation of results")
-        try:
-            # IMPROVEMENT 1: Automatically point to the generated Excel file
-            # Use the output path from session state if available
-            default_path = st.session_state.get(
-                "explorer_uploaded_file_path") if "explorer_uploaded_file_path" in st.session_state else st.session_state.get(
-                "output_path", "evaluated_solutions.xlsx")
-            output_path = st.text_input("Path to Results File", value=default_path)
-
-            # Load data
-            if output_path.endswith(".xlsx") and os.path.exists(output_path):
-                df_all = pd.read_excel(output_path, engine='openpyxl')
-            elif output_path.endswith(".csv") and os.path.exists(output_path):
-                df_all = pd.read_csv(output_path)
-            else:
-                st.warning("Results file not found.")
-                df_all = None
-
-            if df_all is not None:
-                # Calculate weighted sum if not present
-                if 'Weighted Sum' not in df_all.columns:
-                    # Calculate weighted sum based on objectives and weights
-                    weighted_sum = np.zeros(len(df_all))
-                    for i, (obj, w) in enumerate(zip(objective_names_list, weights)):
-                        if obj in df_all.columns:
-                            weighted_sum += df_all[obj].astype(float) * w
-
-                    # Add weighted sum to the DataFrame
-                    df_all['Weighted Sum'] = weighted_sum
-
-                # Add filters for each parameter
-                st.write("### Filter by Parameter Values")
-
-                # Add filters for each parameter
-                filters = {}
-                for col in st.session_state['param_names']:
-                    min_val = float(df_all[col].min())
-                    max_val = float(df_all[col].max())
-                    selected_range = st.slider(
-                        f"{col}", min_val, max_val, (max_val, min_val), step=0.1
-                    )
-                    filters[col] = selected_range
-
-                st.write("### Filter by Objective Values")
-                for col in st.session_state['objective_names']:
-                    min_val = float(df_all[col].min())
-                    max_val = float(df_all[col].max())
-                    selected_range = st.slider(
-                        f"{col}", min_val, max_val, (min_val, max_val), step=0.1
-                    )
-                    filters[col] = selected_range
-
-                # Weighted Sum filter
-                st.write("### Filter by Weighted Sum")
-                min_val = float(df_all['Weighted Sum'].min())
-                max_val = float(df_all['Weighted Sum'].max())
-                selected_range = st.slider(
-                    "Weighted Sum", min_val, max_val, (min_val, max_val), step=0.1
-                )
-                filters['Weighted Sum'] = selected_range
-
-                # Apply all filters
-                filtered_df = df_all.copy()
-                for col, (low, high) in filters.items():
-                    filtered_df = filtered_df[(filtered_df[col] >= low) & (filtered_df[col] <= high)]
-
-                st.write(f"Filtered to {len(filtered_df)} solutions.")
-
-                # Create dimensions for parallel coordinates with non-overlapping tick labels
-                dimensions_all = []
-
-                combined_cols = st.session_state['param_names'] + st.session_state['objective_names']
-                if 'Weighted Sum' in combined_cols:
-                    combined_cols.remove('Weighted Sum')
-
-                for col in combined_cols:
-                    col_min = filtered_df[col].min()
-                    col_max = filtered_df[col].max()
-                    dimensions_all.append(create_dimension(col, filtered_df[col], col_min, col_max))
-
-                # Add weighted sum axis at the far right
-                weighted_min = filtered_df['Weighted Sum'].min()
-                weighted_max = filtered_df['Weighted Sum'].max()
-                dimensions_all.append(
-                    create_dimension('Weighted Sum', filtered_df['Weighted Sum'], weighted_min, weighted_max))
-
-                # IMPROVEMENT 3: Change unselected solutions to light gray
-                # Ensure we use Weighted Sum for color scaling
-                fig_all = go.Figure(data=go.Parcoords(
-                    line=dict(
-                        color=filtered_df["Weighted Sum"],  # Always use Weighted Sum for color
-                        colorscale='Tealrose',
-                        showscale=True,
-                        colorbar=dict(title='Weighted Sum', nticks=11)
-                    ),
-                    dimensions=dimensions_all,
-                    unselected=dict(line=dict(opacity=0)),
-                    rangefont=dict(family="Arial", size=14),
-                    tickfont=dict(family="Arial", size=11, weight="bold", color="black")
-                ))
-
-                fig_all.update_layout(
-                    title="All Computed Solutions (Filtered)",
-                    height=600,
-                    margin=dict(l=50, r=50, t=100, b=50),
-                    font=dict(family="Arial", size=14)
-                )
-
-                st.plotly_chart(fig_all, use_container_width=True)
-
-                # Export button for filtered solutions
-                if len(filtered_df) > 0:
-                    # Convert DataFrame to Excel bytes for download
-                    from io import BytesIO
-                    excel_buffer = BytesIO()
-                    filtered_df.to_excel(excel_buffer, index=False, engine='openpyxl')
-                    excel_data = excel_buffer.getvalue()
-
-                    st.download_button(
-                        label="Export Filtered Solutions",
-                        data=excel_data,
-                        file_name="filtered_solutions.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
-                    )
-
-        except Exception as e:
-            st.error(f"Error in All Computed Solutions section: {e}")
-            import traceback
-            st.code(traceback.format_exc())
-
-
-# Helper function to calculate weighted sum for Explorer tab
-def calculate_explorer_weighted_sum(objective_values, weights):
-    """Calculate normalized weighted sum for Explorer tab using a different scoring system"""
-    try:
-        # objective_values is a 2D array: (solutions x objectives)
-        num_solutions, num_objectives = objective_values.shape
-
-        # Initialize normalized scores matrix
-        normalized_scores = np.zeros((num_solutions, num_objectives))
-
-        # For each objective
-        for obj_idx, weight in enumerate(weights):
-            obj_values = objective_values[:, obj_idx]
-
-            # Find min and max values for this objective
-            min_val = np.min(obj_values)
-            max_val = np.max(obj_values)
-
-            if max_val == min_val:
-                # All values are the same, give everyone the full weight
-                normalized_scores[:, obj_idx] = abs(weight)
-            else:
-                # Determine if we're minimizing or maximizing based on weight sign
-                if weight < 0:  # Minimizing objective
-                    # Best (minimum) value gets full weight, worst (maximum) gets 0
-                    normalized_scores[:, obj_idx] = abs(weight) * (max_val - obj_values) / (max_val - min_val)
-                else:  # Maximizing objective
-                    # Best (maximum) value gets full weight, worst (minimum) gets 0
-                    normalized_scores[:, obj_idx] = abs(weight) * (obj_values - min_val) / (max_val - min_val)
-
-        # Sum all objective scores to get final weighted sum
-        weighted_sums = np.sum(normalized_scores, axis=1)
-
-        return weighted_sums
-
-    except Exception as e:
-        st.error(f"Error calculating explorer weighted sum: {e}")
-        return np.zeros(len(objective_values))
-
-
-# Main function
-def explore_uploaded_results():
-    st.title("Explorer")
-    st.write("Upload and explore previously computed optimization results")
-
-    num_objectives = st.number_input(
-        "Enter Number of Objectives",
-        min_value=1,
-        value=4,
-        key="explorer_num_objectives"
-    )
-    uploaded_file = st.file_uploader(
-        "Upload Optimization Results (.xlsx or .csv)",
-        type=["xlsx", "csv"],
-        key="explorer_file_upload"
-    )
-
-    if uploaded_file is None:
-        st.warning("Please upload a valid optimization result file to proceed.")
-        return
-
-    # Load the full DataFrame from uploaded file
-    try:
-        if uploaded_file.name.endswith(".xlsx"):
-            df = pd.read_excel(uploaded_file, engine='openpyxl')
+                st.error('The labels file must have exactly one column and one nonempty label per training row.')
+    with st.form(key + '_form'):
+        parameter = st.selectbox('Parameter to withhold by level', params, key=key + '_param') if mode == 'Unseen parameter levels' else None
+        folds = st.slider('Outer test folds', 3, 5, 5, key=key + '_folds') if mode != 'Unseen parameter levels' else 5
+        repeats = st.slider('Repeated tests', 1, 3, 1, key=key + '_repeats') if mode != 'Unseen parameter levels' else 1
+        tolerances = {o: st.number_input(f'Acceptable absolute error — {o}', min_value=0.0,
+            value=float(np.ptp(data[o].to_numpy()) * .05), key=key + '_tol_' + str(i)) for i, o in enumerate(objectives)}
+        st.caption('Tolerances use the original objective units. Defaults are 5% of each observed range, not acceptance recommendations. '
+                   'For SDA stored on a 0–100 scale, enter 5 for ±5 percentage points.')
+        st.caption('Each outer split retrains and selects models using only its training cases. '
+                   'Repeated tests and parameter-level tests can take several minutes. '
+                   'A grouped outer test holds buildings out entirely; internal model selection uses the standard row-based CV.')
+        submitted = st.form_submit_button('Run accuracy audit')
+        st.form_submit_button('Apply tolerances without retraining')
+    config = dict(mode=mode, folds=folds, repeats=repeats, parameter=parameter, groups=groups)
+    identity = (signature, json.dumps(config, sort_keys=True))
+    slot = key + '_result'
+    if submitted:
+        if mode == 'Unseen buildings' and groups is None:
+            st.error('Upload valid building labels before running this test.')
         else:
-            df = pd.read_csv(uploaded_file)
-    except Exception as e:
-        st.error(f"Error loading uploaded file: {e}")
-        return
-
-    # Identify the 'Weighted Sum' column (must exist or will be calculated)
-    ws_col = 'Weighted Sum' if 'Weighted Sum' in df.columns else None
-
-    # Identify any uncertainty columns
-    uncertainty_cols = [c for c in df.columns if c.startswith("Uncertainty_")]
-
-    # Core data columns: drop uncertainties + weighted sum if present
-    exclude_cols = uncertainty_cols + ([ws_col] if ws_col else [])
-    core_cols = [c for c in df.columns if c not in exclude_cols]
-
-    if len(core_cols) < num_objectives:
-        st.error(f"Number of objectives ({num_objectives}) exceeds available data columns ({len(core_cols)}).")
-        return
-
-    # Split core_cols into parameters vs. objectives
-    param_names = core_cols[:-num_objectives]
-    objective_names = core_cols[-num_objectives:]
-    weights = [-1.0 for _ in objective_names]  # Default to minimization
-
-    # Allow user to adjust weights
-    with st.expander("Setup Objectives Weights", expanded=False):
-        st.write("### Setup Objectives Weights")
-        st.write("Set weights for each objective (negative for minimization, positive for maximization)")
-
-        col1, col2, col3 = st.columns(3)
-        for i, obj_name in enumerate(objective_names):
-            col = [col1, col2, col3][i % 3]
-            with col:
-                weights[i] = st.number_input(
-                    f"Weight for {obj_name}",
-                    value=-1.0,
-                    help="Negative for minimization, positive for maximization",
-                    key=f"explorer_weight_{obj_name}"
-                )
-
-    # Display basic statistics
-    with st.expander("Dataset Overview", expanded=False):
-        st.write("### Dataset Overview")
-        st.write(f"**Total Solutions:** {len(df)}")
-        st.write(f"**Parameters:** {', '.join(param_names)}")
-        st.write(f"**Objectives:** {', '.join(objective_names)}")
-
-    # === Estimate Objectives for Custom Parameter Combination in Explorer ===
-    with st.expander("Estimate Objectives Results for Custom Parameters Values", expanded=False):
-        st.write("## Estimate Objectives Results for Custom Parameters Values")
-        st.write(
-            "Here you can estimate what is expected to be the result for each individual objective for entered parameter values")
-
-        st.markdown("#### Model selection (Explorer)")
-        explorer_model_strategy = st.radio(
-            "Model strategy for Explorer estimation",
-            options=["Auto (recommended)", "Manual per objective"],
-            index=0,
-            key="explorer_model_strategy",
-            help="Auto: PAMO selects Ridge / Random Forest / Hybrid per objective using cross-validated NMAE on the uploaded dataset."
-        )
-
-        explorer_objective_overrides = {obj: "Auto" for obj in objective_names}
-        if str(explorer_model_strategy).lower().startswith("manual"):
-            st.caption("Manual overrides apply only to Explorer estimation.")
-            for obj in objective_names:
-                explorer_objective_overrides[obj] = st.selectbox(
-                    f"Model for {obj}",
-                    options=["Auto", "Ridge", "Random Forest", "Hybrid"],
-                    index=0,
-                    key=f"explorer_model_override_{obj}"
-                )
-
-        st.write("### Enter parameter values to simulate:")
-
-        input_values = {}
-        col1, col2, col3 = st.columns(3)
-        for i, param in enumerate(param_names):
-            col = [col1, col2, col3][i % 3]
-            with col:
-                input_values[param] = st.number_input(f"{param}", key=f"explorer_custom_input_{i}")
-
-        input_array = np.array([[input_values[p] for p in param_names]])
-        if st.button("Estimate Objectives Results", key="explorer_estimate_btn"):
+            bar = st.progress(0.0)
             try:
-                # Train (or reuse) Explorer models on the uploaded dataset (do not overwrite Training-tab models)
-                ridge_alpha = float(st.session_state.get("ridge_alpha", 0.1))
-                cv_folds = int(st.session_state.get("cv_folds", 5))
-                rf_trees = int(st.session_state.get("rf_n_estimators", 50))
-                num_cores = int(st.session_state.get("num_cores", 1))
-
-                # Use only parameter + objective columns for training
-                df_train = df[param_names + objective_names].copy()
-
-                signature = (
-                    getattr(uploaded_file, "name", "uploaded"),
-                    tuple(df_train.shape),
-                    tuple(param_names),
-                    tuple(objective_names),
-                    str(explorer_model_strategy),
-                    tuple(explorer_objective_overrides.get(o, "Auto") for o in objective_names),
-                    float(ridge_alpha),
-                    int(cv_folds),
-                    int(rf_trees),
-                    int(num_cores),
-                )
-
-                if st.session_state.get("explorer_models_signature") != signature:
-                    st.info("Training surrogate models for Explorer estimation (per objective)...")
-                    models, _, _ = preprocess_and_train_with_cv(
-                        df_train,
-                        len(objective_names),
-                        ridge_alpha=ridge_alpha,
-                        cv_folds=cv_folds,
-                        model_selection_mode="Auto" if str(explorer_model_strategy).lower().startswith("auto") else "Manual",
-                        objective_model_overrides=explorer_objective_overrides,
-                        store_in_session=False
-                    ,
-                        rf_n_estimators=int(rf_trees),
-                        num_cores=int(num_cores),
-                        data_signature=compute_df_signature(df_train)
-                    )
-                    st.session_state["explorer_models"] = models
-                    st.session_state["explorer_models_signature"] = signature
-                else:
-                    models = st.session_state.get("explorer_models", [])
-
-                if not models:
-                    st.error("No models available for Explorer estimation.")
-                    st.stop()
-
-                # Show which model was selected per objective (transparency)
-                try:
-                    kinds = [getattr(m, "kind", type(m).__name__) for m in models]
-                    st.dataframe(pd.DataFrame({"Objective": objective_names, "Selected model": kinds}), use_container_width=True)
-                except Exception:
-                    pass
-                st.subheader("Estimated Objective Values")
-                preds = [model.predict(input_array)[0] for model in models]
-                df_estimates = pd.DataFrame({
-                    "Objective": objective_names,
-                    "Estimated Value": [f"{p:.2f}" for p in preds]
-                })
-                st.dataframe(df_estimates, use_container_width=True)
-
-                # RADAR CHART IMPLEMENTATION - REPLACES GAUGE CHARTS
-                # Collect all data for radar chart
-                all_pred_values = []
-                all_obj_names = []
-                all_obj_min = []
-                all_obj_max = []
-                all_normalized_values = []
-                all_percentiles = []
-
-                # Collect values from the loop and normalize each objective individually
-                for i, (obj, pred) in enumerate(zip(objective_names, preds)):
-                    obj_values = df[obj].values
-                    obj_min, obj_max = obj_values.min(), obj_values.max()
-
-                    # Normalize the prediction value to 0-100 scale for this specific objective
-                    if obj_max > obj_min:
-                        normalized_pred = ((float(pred) - obj_min) / (obj_max - obj_min)) * 100
-                    else:
-                        normalized_pred = 50  # If min == max, put it in the middle
-
-                    try:
-                        _vals = np.asarray(obj_values, dtype=float)
-                        percentile = float(np.mean(_vals <= float(pred)) * 100.0) if len(_vals) else 50.0
-                    except Exception:
-                        percentile = 50.0
-
-                    all_pred_values.append(float(pred))  # Keep original values for hover/display
-                    all_obj_names.append(str(obj))
-                    all_obj_min.append(obj_min)
-                    all_obj_max.append(obj_max)
-                    all_normalized_values.append(normalized_pred)
-                    all_percentiles.append(percentile)
-
-                # Close the polygon: Add the first point at the end
-                all_normalized_values_closed = all_normalized_values + [all_normalized_values[0]]
-                all_obj_names_closed = all_obj_names + [all_obj_names[0]]
-                all_pred_values_closed = all_pred_values + [all_pred_values[0]]
-                all_obj_min_closed = all_obj_min + [all_obj_min[0]]
-                all_obj_max_closed = all_obj_max + [all_obj_max[0]]
-
-                # Create single radar chart with individual axis scaling and closed polygon
-                fig = go.Figure()
-
-                fig.add_trace(go.Scatterpolar(
-                    r=all_normalized_values_closed,  # Use closed data
-                    theta=all_obj_names_closed,  # Use closed data
-                    fill='toself',
-                    fillcolor='rgba(154, 205, 50, 0.3)',  # yellowgreen with transparency
-                    line=dict(color='yellowgreen', width=4),
-                    marker=dict(size=8, color='yellowgreen'),
-                    name='Predictions',
-                    text=[f'{obj}: {val:.2f}<br>Range: {min_val:.2f} - {max_val:.2f}'
-                          for obj, val, min_val, max_val in
-                          zip(all_obj_names_closed, all_pred_values_closed, all_obj_min_closed, all_obj_max_closed)],
-                    hovertemplate='%{text}<br>Normalized: %{r:.1f}%<extra></extra>'
-                ))
-
-                fig.update_layout(
-                    polar=dict(
-                        radialaxis=dict(
-                            visible=True,
-                            range=[0, 100],  # Fixed 0-100 scale since we normalized the values
-                            ticksuffix='%',
-                            gridcolor='lightslategrey',
-                            tickmode='linear',
-                            tick0=0,
-                            dtick=20  # Show ticks every 20%
-                        ),
-                        angularaxis=dict(
-                            gridcolor='lightslategrey'
-                        )
-                    ),
-                    height=500,
-                    margin=dict(t=50, b=50),
-                    showlegend=False,
-                )
-
-                st.plotly_chart(fig, use_container_width=True)
-
-                # Display the values in a table for reference with individual scales (use original data, not closed)
-                df_estimates_detailed = pd.DataFrame({
-                    "Objective": all_obj_names,  # Use original data for table
-                    "Estimated Value": [f"{p:.2f}" for p in all_pred_values],
-                    "Min Range": [f"{m:.2f}" for m in all_obj_min],
-                    "Max Range": [f"{m:.2f}" for m in all_obj_max],
-                    "Normalized (%)": [f"{n:.1f}%" for n in all_normalized_values],
-                    "Percentile": [f"{p:.1f}%" for p in all_percentiles],
-                })
-                st.table(df_estimates_detailed)
-
-            except Exception as e:
-                st.error(f"Error training models or making predictions: {e}")
-
-    # Display the All Computed Solutions diagram using uploaded data with new weighted sum calculation
-    with st.expander("All Computed Solutions (Interactive)", expanded=False):
-        st.write("## All Computed Solutions (Interactive) - Explorer")
-        st.write(
-            "Here you can filter solutions by parameter and|or objective values range for a deeper investigation of uploaded results")
-
-        try:
-            # Calculate weighted sum using the new normalized scoring system for Explorer only
-            df_display = df.copy()
-            if 'Weighted Sum' not in df_display.columns:
-                # Extract objective values for calculation
-                objective_values = []
-                for obj in objective_names:
-                    if obj in df_display.columns:
-                        objective_values.append(df_display[obj].astype(float).values)
-
-                if objective_values:
-                    # Convert to numpy array (solutions x objectives)
-                    objective_matrix = np.column_stack(objective_values)
-                    # Calculate normalized weighted sum using the new scoring system
-                    weighted_sums = calculate_explorer_weighted_sum(objective_matrix, weights)
-                    # Add weighted sum to the DataFrame
-                    df_display['Weighted Sum'] = weighted_sums
-
-            # Add filters for each parameter
-            st.write("### Filter by Parameter Values")
-            filters = {}
-            for col in param_names:
-                if col in df_display.columns:
-                    min_val = float(df_display[col].min())
-                    max_val = float(df_display[col].max())
-                    selected_range = st.slider(
-                        f"{col}", min_val, max_val, (min_val, max_val), step=0.1,
-                        key=f"explorer_param_{col}"
-                    )
-                    filters[col] = selected_range
-
-            st.write("### Filter by Objective Values")
-            for col in objective_names:
-                if col in df_display.columns:
-                    min_val = float(df_display[col].min())
-                    max_val = float(df_display[col].max())
-                    selected_range = st.slider(
-                        f"{col}", min_val, max_val, (min_val, max_val), step=0.1,
-                        key=f"explorer_obj_{col}"
-                    )
-                    filters[col] = selected_range
-
-            # Weighted Sum filter
-            st.write("### Filter by Weighted Sum")
-            min_val = float(df_display['Weighted Sum'].min())
-            max_val = float(df_display['Weighted Sum'].max())
-            selected_range = st.slider(
-                "Weighted Sum", min_val, max_val, (min_val, max_val), step=0.1,
-                key="explorer_weighted_sum"
-            )
-            filters['Weighted Sum'] = selected_range
-
-            # Apply all filters
-            filtered_df = df_display.copy()
-            for col, (low, high) in filters.items():
-                if col in filtered_df.columns:
-                    filtered_df = filtered_df[(filtered_df[col] >= low) & (filtered_df[col] <= high)]
-
-            st.write(f"Filtered to {len(filtered_df)} solutions from uploaded data.")
-
-            # Create dimensions for parallel coordinates
-            dimensions_all = []
-
-            # Add parameter dimensions
-            for col in param_names:
-                if col in filtered_df.columns:
-                    col_min = filtered_df[col].min()
-                    col_max = filtered_df[col].max()
-                    dimensions_all.append(dict(
-                        range=[col_min, col_max],
-                        label=col,
-                        values=filtered_df[col]
-                    ))
-
-            # Add objective dimensions
-            for col in objective_names:
-                if col in filtered_df.columns:
-                    col_min = filtered_df[col].min()
-                    col_max = filtered_df[col].max()
-                    dimensions_all.append(dict(
-                        range=[col_min, col_max],
-                        label=col,
-                        values=filtered_df[col]
-                    ))
-
-            # Add weighted sum axis at the far right
-            if 'Weighted Sum' in filtered_df.columns:
-                weighted_min = filtered_df['Weighted Sum'].min()
-                weighted_max = filtered_df['Weighted Sum'].max()
-                dimensions_all.append(dict(
-                    range=[weighted_max, weighted_min],
-                    label='Score',
-                    values=filtered_df['Weighted Sum']
-                ))
-
-            # Create parallel coordinates plot for uploaded data with EXACT same parameters as original
-            fig_all = go.Figure(data=go.Parcoords(
-                line=dict(
-                    color=filtered_df["Weighted Sum"] if 'Weighted Sum' in filtered_df.columns else filtered_df.iloc[:,
-                                                                                                    -1],
-                    colorscale='Tealrose_r',
-                    showscale=True,
-                    colorbar=dict(title='Score', nticks=11)
-                ),
-                dimensions=dimensions_all,
-                unselected=dict(line=dict(opacity=0)),
-                rangefont=dict(family="Arial", size=14),
-                tickfont=dict(family="Arial", size=11, weight="bold", color="black")
-            ))
-
-            fig_all.update_layout(
-                title="All Computed Solutions (Filtered)",
-                height=600,
-                margin=dict(l=50, r=50, t=100, b=50),
-                font=dict(family="Arial", size=14)
-            )
-
-            st.plotly_chart(fig_all, use_container_width=True)
-
-            # Export button for filtered solutions from uploaded data
-            if len(filtered_df) > 0:
-                # Convert DataFrame to Excel bytes for download
-                from io import BytesIO
-                excel_buffer = BytesIO()
-                filtered_df.to_excel(excel_buffer, index=False, engine='openpyxl')
-                excel_data = excel_buffer.getvalue()
-
-                st.download_button(
-                    label="Export Filtered Solutions",
-                    data=excel_data,
-                    file_name="uploaded_filtered_solutions.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                    key="explorer_export_btn",
-                    use_container_width=True
-                )
-
-        except Exception as e:
-            st.error(f"Error in All Computed Solutions section: {e}")
-            import traceback
-            st.code(traceback.format_exc())
+                with st.spinner('Training independent audit models; this can take several minutes...'):
+                    predictions = run_accuracy_audit(data, num_objectives, settings, overrides, **config,
+                        progress=lambda value, text: bar.progress(value, text=text))
+                st.session_state[slot] = (identity, predictions)
+            except Exception as exc:
+                st.error(f'Accuracy audit could not complete: {exc}')
+            finally:
+                bar.empty()
+    stored = st.session_state.get(slot)
+    if stored is None or stored[0] != identity:
+        st.info('Run the audit to see results for these data, model settings and test configuration.')
+        return
+    predictions = stored[1]
+    st.caption('Positive error means overprediction. Repeats reuse the same cases; they are not additional independent data. '
+               'R² is not percentage accuracy and is undefined for constant test targets. '
+               'Identical inputs stay together in the combinations test. Input-level and building tests assess harder generalisation.')
+    metrics = audit_metrics(predictions, tolerances)
+    st.dataframe(metrics, hide_index=True, width='stretch')
+    with st.expander('Results by test split'):
+        st.dataframe(audit_metrics(predictions, tolerances, True), hide_index=True, width='stretch')
+    objective = st.selectbox('Inspect objective', objectives, key=key + '_objective')
+    repeat = st.selectbox('Inspect repeat', sorted(predictions['Repeat'].unique()), key=key + '_repeat')
+    selected = predictions[(predictions.Objective == objective) & (predictions.Repeat == repeat)]
+    fig = make_subplots(rows=1, cols=2, subplot_titles=('Prediction versus actual', 'Prediction error'))
+    fig.add_trace(go.Scatter(x=selected.Actual, y=selected.Prediction, mode='markers',
+        customdata=selected[['Data row']], hovertemplate='Data row %{customdata[0]}<br>Actual: %{x}<br>Predicted: %{y}<extra></extra>', name='Held-out cases'), row=1, col=1)
+    low, high = min(selected.Actual.min(), selected.Prediction.min()), max(selected.Actual.max(), selected.Prediction.max())
+    fig.add_trace(go.Scatter(x=[low, high], y=[low, high], mode='lines', line=dict(dash='dash'), name='Perfect prediction'), row=1, col=1)
+    fig.add_trace(go.Scatter(x=selected.Actual, y=selected.Error, mode='markers', name='Error'), row=1, col=2)
+    fig.add_hline(y=0, row=1, col=2)
+    for sign in (-1, 1):
+        fig.add_hline(y=sign * tolerances[objective], line_dash='dot', line_color='#16804a', row=1, col=2)
+    fig.update_xaxes(title_text='Actual supplied value')
+    fig.update_yaxes(title_text='Prediction', row=1, col=1)
+    fig.update_yaxes(title_text='Prediction minus actual', row=1, col=2)
+    fig.update_layout(height=420, title=objective)
+    st.plotly_chart(fig, width='stretch', key=key + '_charts')
+    st.write('Largest prediction errors — selected objective and repeat')
+    st.dataframe(selected.sort_values('Absolute error', ascending=False).head(20), hide_index=True, width='stretch')
+    if st.button('Prepare audit download', key=key + '_prepare_audit'):
+        archive = BytesIO()
+        metadata = dict(version=VERSION, data_signature=compute_df_signature(data), settings=settings,
+                        overrides=overrides, configuration=config, tolerances=tolerances,
+                        note='Data row is 1-based within the imported table, excluding the header. Errors use original units.')
+        with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as z:
+            z.writestr('predictions.csv', predictions.to_csv(index=False))
+            z.writestr('metrics.csv', metrics.to_csv(index=False))
+            z.writestr('metrics_by_split.csv', audit_metrics(predictions, tolerances, True).to_csv(index=False))
+            z.writestr('configuration.json', json.dumps(metadata, indent=2, default=str))
+        st.session_state[key + '_download'] = (identity, dict(tolerances), archive.getvalue())
+    prepared = st.session_state.get(key + '_download')
+    if prepared and prepared[:2] == (identity, tolerances):
+        st.download_button('Download accuracy audit', prepared[2], 'pamo_accuracy_audit.zip',
+            'application/zip', key=key + '_download_button', on_click='ignore')
 
 
-# Main function
-def main():
+def render_verification(bundle, key):
+    st.dataframe(pd.DataFrame(bundle['reports']), hide_index=True, use_container_width=True)
+    fig = go.Figure()
+    for name, scores in zip(bundle['objective_names'], bundle['cv_scores']):
+        fig.add_trace(go.Box(y=scores, name=name, boxpoints='all'))
+    fig.update_layout(title='Cross-Validation Performance by Objective', yaxis_title='R²', height=350)
+    st.plotly_chart(fig, use_container_width=True, key=key + '_cv')
+    render_sensitivity(bundle, key + '_sensitivity')
+    st.subheader('Testing Model Predictions')
+    st.write(f"Sample input: {bundle['sample']}")
+    for i, (name, model) in enumerate(zip(bundle['objective_names'], bundle['models'])):
+        st.write(f'Objective {i + 1} ({name}) prediction: {model.predict([bundle["sample"]])[0]:.2f}')
+
+
+def render_learning_curves(bundle, folds, key):
+    if st.button('Calculate learning curves', key=key + '_calculate'):
+        with st.spinner('Calculating learning curves...'):
+            data = bundle['training_data']
+            cv = KFold(n_splits=min(folds, len(data) // 2), shuffle=True, random_state=42)
+            curves = []
+            for name, estimator in zip(bundle['objective_names'], bundle['plot_estimators']):
+                sizes, train, test = learning_curve(estimator, data[bundle['param_names']], data[name],
+                    cv=cv, train_sizes=np.linspace(0.4, 1, 5), scoring='r2', n_jobs=1)
+                curves.append((name, sizes, np.nanmean(train, axis=1), np.nanmean(test, axis=1),
+                               np.nanstd(train, axis=1), np.nanstd(test, axis=1)))
+            bundle['learning_curves'] = curves
+    if bundle.get('learning_curves') is not None:
+        st.caption('Shaded bands show ±1 standard deviation across validation folds. '
+                   'They describe fold variability, not prediction confidence intervals.')
+        for name, sizes, train, test, train_std, test_std in bundle['learning_curves']:
+            fig = go.Figure()
+            for label, mean, spread, color, fill in (
+                ('Training R²', train, train_std, '#16804a', 'rgba(22,128,74,0.15)'),
+                ('CV R²', test, test_std, '#326b9a', 'rgba(50,107,154,0.15)')):
+                fig.add_trace(go.Scatter(x=sizes, y=mean - spread, mode='lines',
+                    line=dict(width=0), showlegend=False, legendgroup=label, hoverinfo='skip'))
+                fig.add_trace(go.Scatter(x=sizes, y=mean + spread, mode='lines',
+                    line=dict(width=0), fill='tonexty', fillcolor=fill,
+                    showlegend=False, legendgroup=label, hoverinfo='skip'))
+                fig.add_trace(go.Scatter(x=sizes, y=mean, name=label, legendgroup=label,
+                    mode='lines+markers', line_color=color, customdata=spread,
+                    hovertemplate='Training samples: %{x}<br>Mean R²: %{y:.3f}'
+                                  '<br>Fold SD: %{customdata:.3f}<extra>%{fullData.name}</extra>'))
+            fig.update_layout(title=f'Learning Curve — {name}', xaxis_title='Training samples', yaxis_title='R²')
+            st.plotly_chart(fig, use_container_width=True, key=key + '_' + name)
+
+
+def parallel_figure(df, parameters, objectives, title):
+    dimensions = []
+    for name in parameters + objectives + ['Weighted Sum']:
+        low, high = float(df[name].min()), float(df[name].max())
+        if low == high:
+            low, high = low - 0.1, high + 0.1
+        dimensions.append(dict(label='Score' if name == 'Weighted Sum' else name,
+                               values=df[name], range=[low, high]))
+    fig = go.Figure(go.Parcoords(dimensions=dimensions, line=dict(
+        color=df['Weighted Sum'], colorscale=SCORE_COLORS, showscale=True,
+        colorbar=dict(title='Score')), unselected=dict(line=dict(opacity=0.064))))
+    fig.update_layout(title=title, height=580, margin=dict(t=100, b=40, l=50, r=60))
+    return fig
+
+
+def trend_statistics(results, parameter, objective):
+    """Descriptive summaries at exact observed parameter levels; no interpolation/binning."""
+    grouped = results.groupby(parameter, sort=True)[objective]
+    summary = grouped.agg(['mean', 'median', 'count', 'min', 'max'])
+    summary['q25'] = grouped.quantile(0.25)
+    summary['q75'] = grouped.quantile(0.75)
+    return summary
+
+
+def trend_figure(results, bundle, param):
+    fig = make_subplots(rows=1, cols=len(bundle['objective_names']), subplot_titles=bundle['objective_names'])
+    for col, obj in enumerate(bundle['objective_names'], 1):
+        stats = trend_statistics(results, param, obj)
+        details = np.column_stack([stats['count'], stats['q25'], stats['q75'], stats['min'], stats['max']])
+        fig.add_trace(go.Scattergl(x=results[param], y=results[obj], mode='markers',
+            marker=dict(size=3, opacity=0.18, color='#33966e'), name='All solutions',
+            legendgroup='solutions', showlegend=col == 1), row=1, col=col)
+        # A single observation has no observed within-level spread; omit its band.
+        lower = stats['q25'].where(stats['count'] >= 2)
+        upper = stats['q75'].where(stats['count'] >= 2)
+        fig.add_trace(go.Scatter(x=stats.index, y=lower, mode='lines', line=dict(width=0),
+            hoverinfo='skip', legendgroup='iqr', showlegend=False, connectgaps=False), row=1, col=col)
+        fig.add_trace(go.Scatter(x=stats.index, y=upper, mode='lines', line=dict(width=0),
+            fill='tonexty', fillcolor='rgba(70,130,180,0.20)', name='Middle 50% (P25–P75)',
+            legendgroup='iqr', showlegend=col == 1, connectgaps=False, hoverinfo='skip'), row=1, col=col)
+        hover = ('Parameter: %{x}<br>%{fullData.name}: %{y:.3f}<br>Cases: %{customdata[0]:.0f}'
+                 '<br>P25–P75: %{customdata[1]:.3f} – %{customdata[2]:.3f}'
+                 '<br>Min–max: %{customdata[3]:.3f} – %{customdata[4]:.3f}<extra></extra>')
+        fig.add_trace(go.Scatter(x=stats.index, y=stats['mean'], mode='lines+markers',
+            line=dict(color='#d57532'), name='Mean', legendgroup='mean', showlegend=col == 1,
+            customdata=details, hovertemplate=hover), row=1, col=col)
+        fig.add_trace(go.Scatter(x=stats.index, y=stats['median'], mode='lines+markers',
+            line=dict(color='#326b9a', dash='dash'), marker=dict(symbol='diamond', size=5),
+            name='Median', legendgroup='median', showlegend=col == 1,
+            customdata=details, hovertemplate=hover), row=1, col=col)
+        fig.update_xaxes(title_text=param, row=1, col=col)
+        fig.update_yaxes(title_text=obj, row=1, col=col)
+    fig.update_layout(title=f'Parameter: {param}', height=390,
+                      legend=dict(orientation='h', y=-0.3, x=0), margin=dict(b=100))
+    return fig
+
+
+def render_trends(results, bundle, key, source_label='evaluated combinations'):
+    st.caption(f'Trends use all {len(results):,} {source_label}. Mean and median summarize each exact parameter value. '
+               'The shaded band contains the middle 50% of solution values (25th–75th percentiles). '
+               'Hover on a line for case counts and ranges; click legend entries to show or hide indicators.')
+    st.caption('The band describes variation as other parameters change—not a confidence interval or model uncertainty. '
+               'No band is shown for single-case levels. Lines connect observed levels only; they are not fitted predictions between levels. '
+               'For a constant parameter there is only one summary point, so no directional trend can be inferred.')
+    for param in bundle['param_names']:
+        st.plotly_chart(trend_figure(results, bundle, param), use_container_width=True, key=f'{key}_{param}')
+    if bundle.get('feature_importances') is not None:
+        render_sensitivity(bundle, key + '_sensitivity')
+    else:
+        st.info('Estimate objectives with the current dataset and model settings to show sensitivity diagrams here.')
+
+
+def excel_bytes(df):
+    stream = BytesIO()
+    df.to_excel(stream, index=False, engine='openpyxl')
+    return stream.getvalue()
+
+
+def prepare_table_export(df, filename):
+    """Return bytes, actual filename, MIME type and optional fallback explanation."""
+    target = Path(filename)
+    if target.suffix.lower() not in ('.xlsx', '.csv'):
+        raise ValueError('Use an .xlsx or .csv filename.')
+    reason = None
+    if target.suffix.lower() == '.xlsx':
+        if len(df) > 1_048_575 or len(df.columns) > 16_384:
+            reason = 'The table exceeds Excel worksheet limits.'
+        else:
+            try:
+                return excel_bytes(df), str(target), 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', None
+            except Exception as exc:
+                reason = f'Excel export failed: {exc}'
+        target = target.with_suffix('.csv')
+    return df.to_csv(index=False).encode('utf-8-sig'), str(target), 'text/csv', reason
+
+
+def save_table_export(df, filename):
+    payload, actual, _, reason = prepare_table_export(df, filename)
     try:
-        # Initialize session state
-        initialize_session_state()
+        Path(actual).write_bytes(payload)
+    except OSError as exc:
+        if Path(actual).suffix.lower() != '.xlsx':
+            raise
+        actual = str(Path(actual).with_suffix('.csv'))
+        Path(actual).write_bytes(df.to_csv(index=False).encode('utf-8-sig'))
+        reason = f'Excel file could not be written: {exc}'
+    return actual, reason
 
-        # Sidebar for configuration
-        with st.sidebar.expander("Setup", expanded=False):
-            st.header("Setup")
-            ridge_alpha = st.slider("Ridge alpha (regularization)", min_value=0.001, max_value=10.0, value=0.3, step=0.01,
-                                     format="%.2f", help="Higher alpha = more regularization (smoother model).")
-            st.session_state['ridge_alpha'] = float(ridge_alpha)
 
-            rf_n_estimators = st.slider(
-                "Number of Trees in Random Forest",
-                min_value=1, max_value=200, value=int(st.session_state.get('rf_n_estimators', 50)), step=1,
-                help="Controls Random Forest complexity/smoothness. More trees improve stability but increase runtime."
-            )
-            st.session_state['rf_n_estimators'] = int(rf_n_estimators)
+def download_table(df, filename, key):
+    # Generate a download only on request; filter interactions do not serialize Excel.
+    signature = compute_df_signature(df)
+    slot = key + '_prepared'
+    if st.button('Prepare download (Excel / CSV fallback)', key=key + '_prepare'):
+        try:
+            st.session_state[slot] = (signature, prepare_table_export(df, filename))
+        except Exception as exc:
+            st.error(f'Could not prepare the download: {exc}. Results remain available.')
+    cached = st.session_state.get(slot)
+    if cached and cached[0] == signature:
+        payload, actual, mime, reason = cached[1]
+        if reason:
+            st.warning(reason + ' CSV is available instead.')
+        st.download_button('Download ' + Path(actual).suffix[1:].upper(), payload, Path(actual).name,
+            mime, key=key + '_download', on_click='ignore')
 
-            model_selection_mode = st.radio(
-                "Model strategy",
-                options=["Auto (recommended)", "Manual per objective"],
-                index=0,
-                help="Auto: PAMO selects Ridge / Random Forest / Hybrid independently per objective using cross-validated NMAE.\nManual: you can override the choice per objective in the Training tab."
-            )
-            st.session_state['model_selection_mode'] = model_selection_mode
 
-            cv_folds = st.slider("Cross-Validation Folds", min_value=3, max_value=20, value=5,
-                                 help="Only change if you are sure what you are doing")
-            st.session_state['cv_folds'] = int(cv_folds)
-            st.session_state['num_cores'] = st.slider("Number of CPU Cores", min_value=1, max_value=32, value=16,
-                                                      help="Only change if you are sure what you are doing")
-
-        # Create tabs for Training, Results and Explorer
-        tab1, tab2, tab3 = st.tabs(["Training", "Results", "Explorer"])
-
-        # Results tab content
-        with tab2:
-            if st.session_state['optimization_complete'] and st.session_state['hof']:
-                display_optimization_results()
+def filter_results(df, parameters, objectives, key):
+    with st.form(key + '_filter_form'):
+        st.caption('Set ranges, then apply all filters together. Higher scores are better and appear at the top in green.')
+        filters = {}
+        for i, name in enumerate(parameters + objectives + ['Weighted Sum']):
+            low, high = float(df[name].min()), float(df[name].max())
+            label = 'Score' if name == 'Weighted Sum' else name
+            if low == high:
+                st.caption(f'{label}: fixed at {low:g}')
+                filters[name] = (low, high)
             else:
-                st.info("Run optimization in the Training tab to see results here.")
-                if st.button("Go to Training Tab"):
-                    st.session_state['active_tab'] = "Training"
-                    st.rerun()
+                filters[name] = st.slider(label, low, high, (low, high), key=f'{key}_filter_{i}')
+        submitted = st.form_submit_button('Apply filters')
+    slot = key + '_filters'
+    if submitted or slot not in st.session_state:
+        st.session_state[slot] = filters
+    filtered = df
+    for name, (low, high) in st.session_state[slot].items():
+        if name in filtered:
+            filtered = filtered[filtered[name].between(low, high)]
+    st.write(f'Filtered to {len(filtered):,} solutions from {len(df):,}.')
+    if filtered.empty:
+        st.info('No solutions match these ranges.')
+    else:
+        st.plotly_chart(parallel_figure(filtered, parameters, objectives, 'All Computed Solutions (Filtered)'),
+                        use_container_width=True, key=key + '_plot')
+        download_table(filtered, 'filtered_solutions.xlsx', key + '_export')
 
-        # Explorer tab content
-        with tab3:
-            explore_uploaded_results()
 
-        # Training tab content
-        with tab1:
-            st.title("Training and Optimization")
-            st.write("Setup and Train Machine Learning Model")
-            # Normal parameter setup flow
-            num_objectives = st.number_input("Enter Number of Objectives", min_value=1, value=5)
-            df = load_data(num_objectives)
-            if df is None:
-                return
+def render_prediction(bundle, values, reference, key):
+    x = np.array([values])
+    records = []
+    for name, model in zip(bundle['objective_names'], bundle['models']):
+        prediction = float(model.predict(x)[0])
+        low, high = reference[name].min(), reference[name].max()
+        normalized = 100 * (prediction - low) / (high - low) if high > low else 50.0
+        records.append({'Objective': name, 'Estimated Value': prediction,
+                        'Uncertainty estimate (±)': float(model.predict_uncertainty(x)[0]),
+                        'Min Range': low, 'Max Range': high, 'Normalized (%)': normalized,
+                        'Percentile': float((reference[name] <= prediction).mean() * 100)})
+    table = pd.DataFrame(records)
+    r = table['Normalized (%)'].tolist()
+    theta = table['Objective'].tolist()
+    hover = table[['Estimated Value', 'Min Range', 'Max Range', 'Percentile',
+                   'Uncertainty estimate (±)']].to_numpy().tolist()
+    fig = go.Figure(go.Scatterpolar(r=r + r[:1], theta=theta + theta[:1], fill='toself',
+        line_color='#33966e', customdata=hover + hover[:1],
+        hovertemplate='%{theta}<br>Prediction: %{customdata[0]:.3f}'
+                      '<br>Reference range: %{customdata[1]:.3f} – %{customdata[2]:.3f}'
+                      '<br>Normalized position: %{r:.1f}%<br>Percentile: %{customdata[3]:.1f}%'
+                      '<br>Uncertainty estimate: ±%{customdata[4]:.3f}<extra></extra>'))
+    fig.update_layout(polar=dict(radialaxis=dict(range=[min(0, min(r)), max(100, max(r))], ticksuffix='%')), height=450)
+    st.plotly_chart(fig, use_container_width=True, key=key + '_radar')
+    st.dataframe(table, hide_index=True, use_container_width=True)
+    st.caption('Radar values show position within the reference data range, not desirability. Uncertainty estimates are not calibrated confidence intervals.')
+    training = bundle['training_data']
+    outside = [p for p, v in zip(bundle['param_names'], values) if v < training[p].min() or v > training[p].max()]
+    if outside:
+        st.warning('Outside the training range: ' + ', '.join(outside))
 
-            # Verify that the number of objectives matches the data
-            if len(df.columns) > 0:
-                actual_objectives = min(num_objectives, len(df.columns))
-                if actual_objectives != num_objectives:
-                    st.warning(
-                        f"Number of objectives ({num_objectives}) adjusted to match data columns ({actual_objectives}).")
-                    num_objectives = actual_objectives
 
-            # Use the enhanced training function
-            with st.expander("Model Training and Validation", expanded=False):
-                st.header("Model Training and Validation")
-                st.subheader("Cross-Validation Results")
-                X = df.drop(df.columns[-num_objectives:], axis=1)
-                y = [df[col] for col in df.columns[-num_objectives:]]
-                objective_names = df.columns[-num_objectives:].tolist()
+def parameter_inputs(bundle, key):
+    values = []
+    columns = st.columns(3)
+    for i, param in enumerate(bundle['param_names']):
+        with columns[i % 3]:
+            values.append(st.number_input(param, value=float(bundle['training_data'][param].median()), key=f'{key}_{i}'))
+    return values
 
-                # Manual overrides (optional)
-                model_selection_mode = st.session_state.get('model_selection_mode', 'Auto (recommended)')
-                objective_model_overrides = {}
 
-                if str(model_selection_mode).lower().startswith('manual'):
-                    st.subheader("Manual model selection per objective")
-                    st.caption("If set to Auto, PAMO will decide based on cross-validated NMAE.")
-                    for obj in objective_names:
-                        objective_model_overrides[obj] = st.selectbox(
-                            f"Model for {obj}",
-                            options=["Auto", "Ridge", "Random Forest", "Hybrid"],
-                            index=0,
-                            key=f"model_override_{obj}"
-                        )
+@st.fragment
+def results_panel():
+    run = st.session_state.get('optimization_run')
+    if run is None:
+        st.info('Run optimization in the Training tab to see results here.')
+        return
+    bundle, results = run['bundle'], run['results']
+    params, objectives = bundle['param_names'], bundle['objective_names']
+    front = results[results['Pareto']].sort_values('Weighted Sum', ascending=False)
+    st.subheader('Optimization Results Explorer')
+    st.write(f'{len(results):,} evaluated combinations · {len(front):,} Pareto solutions')
+    st.caption('Pareto solutions are no worse in every active objective and better in at least one than any solution they dominate. Score ranks solutions separately; higher is better.')
+    with st.expander('Optimization Result (Pareto Front)'):
+        st.plotly_chart(parallel_figure(front, params, objectives, 'Solutions in Pareto Front'), use_container_width=True, key='pareto_plot')
+        st.dataframe(front, use_container_width=True)
+    with st.expander('Trend Analysis'):
+        # Lazy rendering prevents closed trend diagrams from slowing every rerun.
+        if st.checkbox('Show trend and sensitivity diagrams', key='show_trends'):
+            render_trends(results, bundle, 'result_trends')
+    with st.expander('Interactive Solution Explorer'):
+        selected = st.selectbox('Select solution to explore:', list(front.index),
+            format_func=lambda i: f'Solution {i + 1} (Score: {results.loc[i, "Weighted Sum"]:.3f})', key='selected_solution')
+        row = results.loc[selected]
+        st.dataframe(pd.DataFrame({'Parameter': params, 'Value': row[params].values}), hide_index=True)
+        st.dataframe(pd.DataFrame({'Objective': objectives, 'Value': row[objectives].values,
+            'Uncertainty (±)': [row['Uncertainty_' + o] for o in objectives], 'Weight': run['weights']}), hide_index=True)
+        selected_fig = parallel_figure(front, params, objectives, 'Selected Solution')
+        selected_fig.data[0].line.color = [1 if i == selected else 0 for i in front.index]
+        selected_fig.data[0].line.colorscale = [[0, '#dddddd'], [1, '#16804a']]
+        selected_fig.data[0].line.showscale = False
+        st.plotly_chart(selected_fig, use_container_width=True, key='selected_solution_plot')
+    with st.expander('Estimate Objectives Results for Custom Parameters Values'):
+        with st.form('results_predict_form'):
+            values = parameter_inputs(bundle, 'result_predict')
+            submit = st.form_submit_button('Estimate Objectives Results')
+        if submit:
+            st.session_state['result_prediction'] = values
+        if 'result_prediction' in st.session_state:
+            render_prediction(bundle, st.session_state['result_prediction'], results, 'results_prediction')
+    with st.expander('All Computed Solutions (Interactive)'):
+        filter_results(results, params, objectives, 'results')
+
+
+def model_overrides(objectives, mode, key):
+    if mode.startswith('Manual'):
+        return {o: st.selectbox(f'Model for {o}', ['Auto', 'Ridge', 'Random Forest', 'Hybrid'], key=f'{key}_{o}') for o in objectives}
+    return {o: 'Auto' for o in objectives}
+
+
+@st.fragment
+def explorer_panel():
+    st.subheader('Explorer')
+    uploaded = st.file_uploader('Upload Optimization Results (.xlsx or .csv)', type=['xlsx', 'csv'], key='explorer_upload')
+    if uploaded is None:
+        st.info('Upload a results file to explore it.')
+        return
+    try:
+        df = read_table(uploaded.getvalue(), uploaded.name)
+        core = [c for c in df if not str(c).startswith('Uncertainty_') and c not in ('Weighted Sum', 'Pareto')]
+        num = st.number_input('Enter Number of Objectives', 1, max(1, len(core) - 1), min(2, max(1, len(core) - 1)), key='explorer_nobj')
+        train = df[core].copy()
+        validate_training_data(train, num)
+        params, objectives = core[:-num], core[-num:]
+        data_key = hashlib.sha256(repr((compute_df_signature(train), num)).encode()).hexdigest()[:12]
+        with st.expander('Setup Objectives Weights'):
+            with st.form('explorer_weights_' + data_key):
+                weights = [st.number_input(f'Weight for {o}', value=-1.0, key=f'exp_weight_{data_key}_{o}',
+                    help='Negative = minimize, positive = maximize, zero = ignore.') for o in objectives]
+                apply_weights = st.form_submit_button('Apply weights')
+            slot = 'explorer_applied_weights_' + data_key
+            if apply_weights or slot not in st.session_state:
+                st.session_state[slot] = weights
+            weights = st.session_state[slot]
+        with st.expander('Dataset Overview'):
+            st.write(f'{len(df):,} solutions; {len(params)} parameters; {len(objectives)} objectives.')
+            st.dataframe(train.describe(), use_container_width=True)
+        with st.expander('Estimate Objectives Results for Custom Parameters Values'):
+            mode = st.radio('Model strategy for Explorer estimation', ['Auto (recommended)', 'Manual per objective'], key='explorer_mode')
+            with st.form('explorer_predict_' + data_key):
+                overrides = model_overrides(objectives, mode, 'explorer_override')
+                values = parameter_inputs(dict(param_names=params, training_data=train), 'explorer_input_' + data_key)
+                submitted = st.form_submit_button('Estimate Objectives Results')
+            settings = dict(st.session_state['settings'], model_selection_mode='Auto' if mode.startswith('Auto') else 'Manual')
+            signature = training_signature(train, num, settings, overrides)
+            # All training output, including the progress message and smoke test, lives here.
+            with st.expander('Training model verification', expanded=False):
+                if submitted:
+                    with st.spinner('Training surrogate models for Explorer estimation (per objective)...'):
+                        bundle = get_training_bundle(train, num, settings, overrides, 'explorer_bundle')
+                    st.session_state['explorer_prediction'] = (signature, values)
+                bundle = st.session_state.get('explorer_bundle')
+                if bundle and bundle['signature'] == signature:
+                    render_verification(bundle, 'explorer_verify')
                 else:
-                    objective_model_overrides = {obj: "Auto" for obj in objective_names}
-
-                st.session_state['objective_model_overrides'] = objective_model_overrides
-
-                models, param_names, objective_names = preprocess_and_train_with_cv(
-                    df,
-                    num_objectives,
-                    ridge_alpha=ridge_alpha,
-                    cv_folds=cv_folds,
-                    model_selection_mode="Auto" if str(model_selection_mode).lower().startswith("auto") else "Manual",
-                    objective_model_overrides=objective_model_overrides,
-                    rf_n_estimators=int(st.session_state.get('rf_n_estimators', 50)),
-                    num_cores=int(st.session_state.get('num_cores', 8)),
-                    data_signature=compute_df_signature(df),
-                )
-
-                if models and y:
-                    st.subheader("Learning Curves")
-                    objective_names_list = list(objective_names)
-                    visualize_model_performance(X, y, st.session_state.get('plot_estimators', models), objective_names_list, cv_folds)
-
-            # Define parameter ranges
-            with st.expander("Setup Training and run Optimization", expanded=False):
-                st.header("Setup Training and run Optimization")
-                st.subheader("Define Parameters Ranges")
-                param_ranges = {}
-
-                # Create columns for better layout
-                col1, col2, col3 = st.columns(3)
-
-                # For each parameter
-                for i, param in enumerate(param_names):
-                    # Determine which column to use
-                    col = [col1, col2, col3][i % 3]
-
-                    with col:
-                        st.write(f"**{param}**")
-                        # Initialize min and max values from the training data
-                        min_val = st.number_input(f"Min", value=float(X[param].min()), key=f"min_{i}")
-                        max_val = st.number_input(f"Max", value=float(X[param].max()), key=f"max_{i}")
-
-                        # Calculate a reasonable default step size (1/10 of the range)
-                        default_step = max(0.1, (float(X[param].max()) - float(X[param].min())) / 10)
-                        step = st.number_input(f"Step", value=default_step, key=f"step_{i}")
-                        param_ranges[param] = (min_val, max_val, step)
-
-                # Define objective weights
-                st.subheader("Define Objective Weights")
-                weights = []
-
-                # Create columns for better layout
-                col1, col2, col3 = st.columns(3)
-
-                # For each objective
-                for i, obj_name in enumerate(objective_names):
-                    # Determine which column to use
-                    col = [col1, col2, col3][i % 3]
-
-                    with col:
-                        st.write(f"**{obj_name}**")
-                        tooltip = "Negative for minimization, positive for maximization"
-                        weight = st.number_input(f"Weight", value=-1.0, help=tooltip, key=f"weight_{i}")
-                        weights.append(weight)
-
-                st.subheader("Run optimization")
-                output_path = st.text_input("Enter the file path for the output Excel file",
-                                            value="evaluated_solutions.xlsx")
-
-                # Number of solutions to display
-                # Optimize parameters
-                if st.button("Optimize Parameters"):
-                    # Create individual class with uncertainty storage
-                    create_individual_class(num_objectives, weights)
-
-                    # Store weights in session state
-                    st.session_state['weights'] = weights
-                    # Check if we have models
-                    models = st.session_state.get('models', [])
-                    if not models:
-                        st.error("No trained models available. Please train models first.")
-                        return
-
-                    # Run optimization with parallel processing
-                    with st.spinner("Optimizing parameters..."):
-                        objective_names_list = list(objective_names)
-                        hof = optimize_parameters_parallel(
-                            param_ranges,
-                            num_objectives,
-                            models,
-                            weights,
-                            output_path,
-                            objective_names_list,
-                            st.session_state.get('objective_uncertainties', None),
-                            models_signature=st.session_state.get('models_signature', ''),
-                            num_cores=int(st.session_state.get('num_cores', 8)),
-                        )
-
-                    if hof:
-                        # Store results in session state for exploration mode
-                        st.session_state['hof'] = hof
-                        st.session_state['param_names'] = list(param_names)
-                        st.session_state['objective_names'] = list(objective_names)
-                        st.session_state['optimization_complete'] = True
-
-                        # Switch to results tab
-                        st.session_state['active_tab'] = "Results"
-                        st.rerun()
-                    else:
-                        st.warning("No solutions found or optimization failed.")
-
-    except Exception as e:
-        st.error(f"An error occurred in the main function: {e}")
-        import traceback
-        st.code(traceback.format_exc())
+                    st.caption('Verification appears after estimating with the current dataset and settings.')
+            saved = st.session_state.get('explorer_prediction')
+            if saved and saved[0] == signature and bundle:
+                render_prediction(bundle, saved[1], train, 'explorer_prediction')
+            with st.expander('Trend Analysis', expanded=False):
+                if st.checkbox('Show trend and sensitivity diagrams', key='explorer_show_trends_' + data_key):
+                    current_bundle = bundle if bundle and bundle['signature'] == signature else dict(
+                        param_names=params, objective_names=objectives)
+                    render_trends(train, current_bundle, 'explorer_trends_' + data_key,
+                                  source_label='uploaded solutions')
+        with st.expander('All Computed Solutions (Interactive)'):
+            display = df.copy()
+            # Always recompute: uploaded scores may use old formulas or different weights.
+            display['Weighted Sum'] = normalized_scores(display[objectives].to_numpy(), weights)
+            weight_key = hashlib.sha256(repr(weights).encode()).hexdigest()[:8]
+            filter_results(display, params, objectives, 'explorer_' + data_key + weight_key)
+    except Exception as exc:
+        st.error(str(exc))
 
 
-if __name__ == "__main__":
+def training_panel():
+    st.subheader('Training and Optimization')
+    num = st.number_input('Enter Number of Objectives', min_value=1, value=2, key='training_nobj')
+    uploaded = st.file_uploader('Upload Training Data Excel file', type=['xlsx'], key='training_upload')
+    if uploaded is None:
+        st.info('Upload training data. Put parameter columns first and objective columns last.')
+        return
+    try:
+        df = read_table(uploaded.getvalue(), uploaded.name)
+        validate_training_data(df, num)
+        params, objectives = list(df.columns[:-num]), list(df.columns[-num:])
+        data_key = hashlib.sha256(repr((compute_df_signature(df), num)).encode()).hexdigest()[:12]
+        settings = st.session_state['settings']
+        with st.expander('Model Training and Validation', expanded=True):
+            with st.form('model_form_' + data_key):
+                overrides = model_overrides(objectives, settings['model_selection_mode'], 'training_override')
+                train_clicked = st.form_submit_button('Train / update models')
+            signature = training_signature(df, num, settings, overrides)
+            if train_clicked:
+                with st.spinner('Training and validating models...'):
+                    get_training_bundle(df, num, settings, overrides, 'training_bundle')
+            bundle = st.session_state.get('training_bundle')
+            ready = bundle is not None and bundle['signature'] == signature
+            if ready:
+                render_verification(bundle, 'training_verify')
+                with st.expander('Learning Curves'):
+                    render_learning_curves(bundle, settings['cv_folds'], 'learning')
+            else:
+                st.info('Click Train / update models to use this dataset and the current model settings.')
+        with st.expander('Verify prediction accuracy', expanded=False):
+            render_accuracy_audit(df, num, settings, overrides, 'audit_' + data_key)
+        with st.expander('Setup Training and run Optimization', expanded=False):
+            st.caption('Edit the complete form, then submit once. Negative weights minimize, positive weights maximize; zero excludes an objective.')
+            with st.form('optimization_form_' + data_key):
+                ranges = {}
+                columns = st.columns(3)
+                for i, param in enumerate(params):
+                    with columns[i % 3]:
+                        st.markdown(f'**{param}**')
+                        low = st.number_input('Min', value=float(df[param].min()), key=f'opt_min_{data_key}_{i}')
+                        high = st.number_input('Max', value=float(df[param].max()), key=f'opt_max_{data_key}_{i}')
+                        step = st.number_input('Step', value=max(0.1, (float(df[param].max()) - float(df[param].min())) / 10), key=f'opt_step_{data_key}_{i}')
+                        ranges[param] = (low, high, step)
+                st.subheader('Define Objective Weights')
+                weights = [st.number_input(f'Weight — {obj}', value=-1.0, key=f'opt_weight_{data_key}_{i}') for i, obj in enumerate(objectives)]
+                output_path = st.text_input('Output Excel or CSV file', value='evaluated_solutions.xlsx')
+                submitted = st.form_submit_button('Optimize Parameters', disabled=not ready)
+            if submitted:
+                _, total = parameter_grid(ranges)
+                st.write(f'Evaluating {total:,} combinations.')
+                # A full results table is kept for the requested trends and filtering.
+                if total > 1_000_000:
+                    raise ValueError('This grid exceeds 1,000,000 combinations. Increase steps or narrow ranges before running.')
+                start = time.perf_counter()
+                progress = st.progress(0.0)
+                results = evaluate_grid(bundle, ranges, weights, progress.progress)
+                st.session_state['optimization_run'] = dict(bundle=bundle, results=results, weights=weights, ranges=ranges)
+                for key in ('result_prediction', 'results_filters', 'selected_solution', 'results_export_prepared'):
+                    st.session_state.pop(key, None)
+                try:
+                    target, fallback_reason = save_table_export(results, output_path)
+                    st.session_state['optimization_notice'] = f'Saved {len(results):,} solutions to {target}. {int(results.Pareto.sum()):,} Pareto solutions. Completed in {time.perf_counter() - start:.1f}s. Open Results to explore.'
+                    if fallback_reason:
+                        st.session_state['optimization_notice'] += f' {fallback_reason} Saved as CSV instead.'
+                except Exception as exc:
+                    st.session_state['optimization_notice'] = f'Optimization completed, but export failed: {exc}. Results remain available in this session.'
+                st.rerun()
+            if 'optimization_notice' in st.session_state:
+                st.info(st.session_state['optimization_notice'])
+    except Exception as exc:
+        st.error(str(exc))
+
+
+def main():
+    st.set_page_config(page_title='WSGT_PAMO Machine Learning', layout='wide', initial_sidebar_state='collapsed')
+    from packaging.version import Version
+    if Version(st.__version__) < Version("1.49.0"):
+        import sys
+        st.error(f"PAMO requires Streamlit 1.49 or newer. This Python environment uses {st.__version__}.")
+        st.write("Stop PAMO, run this command in a terminal, then start PAMO again using the same Python:")
+        st.code(f'"{sys.executable}" -m pip install --upgrade "streamlit>=1.49,<2"', language="text")
+        st.caption("The newer version is needed for Explorer's nested verification panel. Your training data is unchanged.")
+        st.stop()
+    assets = Path(__file__).resolve().parent
+    with st.sidebar:
+        if (assets / 'Pamo_Icon_Black.png').exists():
+            st.image(str(assets / 'Pamo_Icon_Black.png'), width=80)
+        st.markdown('## WSGT_PAMO')
+        st.caption(f'Version {VERSION}')
+        with st.expander('Setup'):
+            with st.form('settings_form'):
+                alpha = st.slider('Ridge alpha (regularization)', 0.001, 10.0, 0.1, 0.001)
+                trees = st.slider('Number of Trees in Random Forest', 1, 200, 50)
+                mode = st.radio('Model strategy', ['Auto (recommended)', 'Manual per objective'])
+                folds = st.slider('Cross-Validation Folds', 3, 20, 5)
+                cores = st.slider('Number of CPU Cores', 1, max(2, os.cpu_count() or 2), min(8, os.cpu_count() or 1))
+                apply = st.form_submit_button('Apply model settings')
+            if apply or 'settings' not in st.session_state:
+                st.session_state['settings'] = dict(ridge_alpha=alpha, rf_n_estimators=trees, cv_folds=folds,
+                    num_cores=cores, model_selection_mode='Auto' if mode.startswith('Auto') else 'Manual')
+        st.markdown('---')
+        st.caption('A product of Werner Sobek Green Technologies GmbH · Fachgruppe Simulation')
+        st.caption('Coded by Rodrigo Carvalho')
+    if (assets / 'WS_Logo.png').exists():
+        st.image(str(assets / 'WS_Logo.png'), width=400)
+    st.title('Machine Learning Assisted Optimization')
+    training, results, explorer = st.tabs(['Training', 'Results', 'Explorer'])
+    with training:
+        training_panel()
+    with results:
+        results_panel()
+    with explorer:
+        explorer_panel()
+
+
+if __name__ == '__main__':
     main()
-
-with st.sidebar:
-    st.markdown("---")
-    st.caption("*A product of*")
-    st.image("WS_Logo.png", width=300)
-    st.caption("Werner Sobek Green Technologies GmbH")
-    st.caption("Fachgruppe Simulation")
-    st.markdown("---")
-    st.caption("*Coded by*")
-    st.caption("Rodrigo Carvalho")
-    st.caption("*Need help? Contact me under:*")
-    st.caption("*email:* rodrigo.carvalho@wernersobek.com")
-    st.caption("*Tel* +49.40.6963863-14")
-    st.caption("*Mob* +49.171.964.7850")
